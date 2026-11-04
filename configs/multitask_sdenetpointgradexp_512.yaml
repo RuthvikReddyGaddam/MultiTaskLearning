@@ -1,0 +1,113 @@
+# configs/multitask_sdenetpointgradexp_512.yaml
+
+experiment:
+  name: multitask_sdenetpointgradexp_4class_512
+  seed: 42
+  output_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/outputs/multitask
+  log_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/logs/multitask
+
+dataset:
+  name: multitask
+  patch_size: 512
+  image_size: 512
+  num_classes: 5
+  num_workers: 2
+  pin_memory: true
+  glas_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/glas_train_patch_512
+  monuseg_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monuseg_train_patch_512
+  monusac_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monusac_train_patch_512
+  monusac_resample_size: 600
+  class_weights:
+    background: 0.05
+    epithelial: 1.0
+    lymphocyte: 1.0
+    neutrophil: 5.0
+    macrophage: 10.0
+
+model:
+  name: multitask_sdenetpointgradexp
+  multitask: true
+  approach: 4class_j
+  encoder:
+    in_channels: 3
+    encoder_channels:
+      - 64
+      - 128
+      - 128
+      - 256
+    sde_r: 3
+  geometric_encoder:
+    in_channels: 3
+    encoder_channels:
+      - 64
+      - 128
+      - 128
+      - 256
+  decoder:
+    decoder_channels:
+      - 256
+      - 128
+      - 128
+      - 64
+    skip_channels:
+      - 128
+      - 128
+      - 64
+    embed_dim: 128
+    num_heads: 4
+    sde_block:
+      - "SE_only"
+      - "Full"
+      - "Full"
+    r:
+      - 16
+      - 16
+      - 8
+    pooled_sizes:
+      - [32, 32]
+      - [64, 64]
+      - [64, 64]
+      - [64, 64]
+    dropout: 0.0
+  heads:
+    multitask:
+      enabled: true
+    approach: 4class_j
+    classification:
+      enabled: true
+      num_classes: 5
+    segmentation:
+      enabled: true
+      num_gland_classes: 4
+      num_cell_classes: 4
+
+training:
+  epochs: 300
+  batch_size: 8
+
+optimizer:
+  name: Adam
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 50
+  eta_min: 0.000001
+
+loss:
+  name: multitask
+  glas_weight: 1.0
+  monuseg_weight: 1.0
+  monusac_weight: 1.0
+  negative_supervision_weight: 0.5
+  j_reg_weight: 1.0
+  ce_weight: 1.0
+  dice_weight: 0.5
+
+checkpoint:
+  path: /cluster/VAST/civalab/users/rgnm9/multi task implementation/checkpoints/multitask
+  resume: true
+  save_best: true
+  save_last: true
+
