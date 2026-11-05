@@ -39,6 +39,9 @@ class TestMultiTaskTrainingDryRun(unittest.TestCase):
 
     def test_dataloader_and_training_step(self):
         dataset_cfg = self.config.get("dataset", {})
+        glas_dir = Path(dataset_cfg.get("glas_dir", ""))
+        if not glas_dir.exists():
+            self.skipTest(f"Data directory does not exist: {glas_dir}")
         training_cfg = self.config.get("training", {})
 
         train_loader = build_multitask_dataloader(
@@ -114,6 +117,9 @@ class TestMultiTaskTrainingDryRun(unittest.TestCase):
             optimizer = build_optimizer(model, self.config)
 
             dataset_cfg = self.config.get("dataset", {})
+            glas_dir = Path(dataset_cfg.get("glas_dir", ""))
+            if not glas_dir.exists():
+                self.skipTest(f"Data directory does not exist: {glas_dir}")
             training_cfg = self.config.get("training", {})
             real_loader = build_multitask_dataloader(
                 glas_dir=dataset_cfg.get("glas_dir"),

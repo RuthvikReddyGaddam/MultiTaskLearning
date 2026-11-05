@@ -1,3 +1,4 @@
 from .Model import Model
+from .ModelMaskedDecoders import ModelMaskedDecoders
 
-__all__ = ["Model"]
+__all__ = ["Model", "ModelMaskedDecoders"]

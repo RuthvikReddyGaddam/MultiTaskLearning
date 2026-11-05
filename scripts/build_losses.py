@@ -29,6 +29,10 @@ def build_multitask_loss(config: Dict[str, Any]) -> MultiTaskLoss:
         or dataset_cfg.get("num_classes", 5)
     )
 
+    normalize_active_patches = bool(loss_cfg.get("normalize_active_patches", True))
+    monusac_seg_weight = float(loss_cfg.get("monusac_seg_weight", 0.5 if normalize_active_patches else 1.0))
+    monusac_cls_weight = float(loss_cfg.get("monusac_cls_weight", 0.5 if normalize_active_patches else 1.0))
+
     return MultiTaskLoss(
         glas_weight=float(loss_cfg.get("glas_weight", 1.0)),
         monuseg_weight=float(loss_cfg.get("monuseg_weight", 1.0)),
@@ -37,6 +41,9 @@ def build_multitask_loss(config: Dict[str, Any]) -> MultiTaskLoss:
         ce_weight=float(loss_cfg.get("ce_weight", 1.0)),
         dice_weight=float(loss_cfg.get("dice_weight", 0.5)),
         negative_supervision_weight=float(loss_cfg.get("negative_supervision_weight", 0.5)),
+        normalize_active_patches=normalize_active_patches,
+        monusac_seg_weight=monusac_seg_weight,
+        monusac_cls_weight=monusac_cls_weight,
         num_gland_classes=num_gland_classes,
         num_cell_classes=num_cell_classes,
         num_classification_classes=num_classification_classes,

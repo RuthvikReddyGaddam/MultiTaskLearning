@@ -10,3 +10,4 @@ logs/
 checkpoints/
 eval_results/
 .ipynb_checkpoints/
+nohup_logs/

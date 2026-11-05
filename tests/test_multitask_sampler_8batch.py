@@ -35,6 +35,9 @@ class TestMultitaskSampler8Batch(unittest.TestCase):
             self.assertTrue(all(448 <= idx < 1098 for idx in batch[6:8]), f"MoNuSAC slice failed: {batch[6:8]}")
 
     def test_dataloader_defaults_to_8(self):
+        glas_dir = Path("data/glas_train_patch_512")
+        if not glas_dir.exists():
+            self.skipTest(f"Data directory not found: {glas_dir}")
         # build_multitask_dataloader default batch size should be 8
         loader = build_multitask_dataloader(
             patch_size=512,

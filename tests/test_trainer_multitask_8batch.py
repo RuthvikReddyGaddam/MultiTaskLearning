@@ -14,23 +14,24 @@ from losses.multitask_loss import MultiTaskLoss
 
 class TestTrainer8Batch(unittest.TestCase):
     def test_train_step_8batch(self):
-        model = Model(approach="4class_j", num_gland_classes=4, num_cell_classes=4, num_classification_classes=5).cuda()
-        criterion = MultiTaskLoss(approach="4class_j", negative_supervision_weight=0.5).cuda()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = Model(approach="4class_j", num_gland_classes=4, num_cell_classes=4, num_classification_classes=5).to(device)
+        criterion = MultiTaskLoss(approach="4class_j", negative_supervision_weight=0.5).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
         # 8-patch batch (4 GLaS, 2 MoNuSeg, 2 MoNuSAC)
         batch = {
-            "image": torch.randn(8, 3, 64, 64).cuda(),
-            "target_4class": torch.randint(0, 4, (8, 64, 64)).cuda(),
-            "binary_mask": torch.randint(0, 2, (8, 1, 64, 64)).float().cuda(),
-            "class_map": torch.full((8, 64, 64), -1, dtype=torch.long).cuda(),
-            "task_id": torch.tensor([0, 0, 0, 0, 1, 1, 2, 2]).cuda(),
-            "is_gland": torch.tensor([True, True, True, True, False, False, False, False]).cuda(),
-            "is_monuseg": torch.tensor([False, False, False, False, True, True, False, False]).cuda(),
-            "is_monusac": torch.tensor([False, False, False, False, False, False, True, True]).cuda(),
+            "image": torch.randn(8, 3, 64, 64, device=device),
+            "target_4class": torch.randint(0, 4, (8, 64, 64), device=device),
+            "binary_mask": torch.randint(0, 2, (8, 1, 64, 64), device=device).float(),
+            "class_map": torch.full((8, 64, 64), -1, dtype=torch.long, device=device),
+            "task_id": torch.tensor([0, 0, 0, 0, 1, 1, 2, 2], device=device),
+            "is_gland": torch.tensor([True, True, True, True, False, False, False, False], device=device),
+            "is_monuseg": torch.tensor([False, False, False, False, True, True, False, False], device=device),
+            "is_monusac": torch.tensor([False, False, False, False, False, False, True, True], device=device),
             "patch_names": [f"p_{i}" for i in range(8)],
         }
-        batch["class_map"][6:8] = torch.randint(0, 5, (2, 64, 64)).cuda()
+        batch["class_map"][6:8] = torch.randint(0, 5, (2, 64, 64), device=device)
 
         class DummyLoader:
             def __iter__(self):
@@ -43,7 +44,7 @@ class TestTrainer8Batch(unittest.TestCase):
             train_loader=DummyLoader(),
             criterion=criterion,
             optimizer=optimizer,
-            device=torch.device("cuda:0"),
+            device=device,
             config={"training": {"epochs": 1}},
             exp_dir="checkpoints/dummy_test_8batch",
         )

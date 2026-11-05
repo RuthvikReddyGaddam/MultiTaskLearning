@@ -11,29 +11,37 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from create_datasets.monuseg_utils import (
-    compute_instance_sdf as compute_monuseg_sdf,
-    compute_3class_target as compute_monuseg_3class,
-    compute_4class_target_with_bottom_hat as compute_monuseg_4class,
-    save_patch_pentaplet as save_monuseg_pentaplet,
-    save_patch_heptaplet as save_monuseg_heptaplet,
-)
-from create_datasets.glas_utils import (
-    compute_instance_sdf as compute_glas_sdf,
-    compute_3class_target as compute_glas_3class,
-    compute_4class_target_with_bottom_hat as compute_glas_4class,
-    save_patch_pentaplet as save_glas_pentaplet,
-    save_patch_heptaplet as save_glas_heptaplet,
-)
-from create_datasets.monusac_utils import (
-    compute_instance_sdf as compute_monusac_sdf,
-    compute_3class_target as compute_monusac_3class,
-    compute_4class_target_with_bottom_hat as compute_monusac_4class,
-    save_patch_pentaplet as save_monusac_pentaplet,
-    save_patch_heptaplet as save_monusac_heptaplet,
-)
+try:
+    import skimage
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+
+if HAS_SKIMAGE:
+    from create_datasets.monuseg_utils import (
+        compute_instance_sdf as compute_monuseg_sdf,
+        compute_3class_target as compute_monuseg_3class,
+        compute_4class_target_with_bottom_hat as compute_monuseg_4class,
+        save_patch_pentaplet as save_monuseg_pentaplet,
+        save_patch_heptaplet as save_monuseg_heptaplet,
+    )
+    from create_datasets.glas_utils import (
+        compute_instance_sdf as compute_glas_sdf,
+        compute_3class_target as compute_glas_3class,
+        compute_4class_target_with_bottom_hat as compute_glas_4class,
+        save_patch_pentaplet as save_glas_pentaplet,
+        save_patch_heptaplet as save_glas_heptaplet,
+    )
+    from create_datasets.monusac_utils import (
+        compute_instance_sdf as compute_monusac_sdf,
+        compute_3class_target as compute_monusac_3class,
+        compute_4class_target_with_bottom_hat as compute_monusac_4class,
+        save_patch_pentaplet as save_monusac_pentaplet,
+        save_patch_heptaplet as save_monusac_heptaplet,
+    )
 
 
+@unittest.skipUnless(HAS_SKIMAGE, "scikit-image not installed in environment")
 class TestDatasetCreationGroundTruths(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())

@@ -26,6 +26,9 @@ class TestEndToEndMultiTaskPipeline(unittest.TestCase):
 
     def test_1_dataset_and_dataloader_generation(self):
         """Step 1: Check that DataLoader yields 512x512 batches with 4:2:2 equality and 4-class target."""
+        glas_dir = Path(self.config["dataset"]["glas_dir"])
+        if not glas_dir.exists():
+            self.skipTest(f"Data directory does not exist: {glas_dir}")
         loader = build_multitask_dataloader(
             glas_dir=self.config["dataset"]["glas_dir"],
             monuseg_dir=self.config["dataset"]["monuseg_dir"],
