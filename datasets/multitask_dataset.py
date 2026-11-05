@@ -131,21 +131,15 @@ def build_multitask_dataloader(
     monuseg_ds = MoNuSegDataset(data_dir=monuseg_dir, transform=None)
 
 
-    if monusac_class_weights is None:
-        monusac_class_weights = {
-            "background": 0.05,
-            "epithelial": 1.0,
-            "lymphocyte": 1.0,
-            "neutrophil": 5.0,
-            "macrophage": 10.0,
-        }
-
     raw_monusac_ds = MoNuSACDataset(data_dir=monusac_dir, transform=None, class_weights=monusac_class_weights)
 
-    # 3. Approach A: Wrap MoNuSAC in ResampledMoNuSACDataset
-    target_resample = monusac_resample_size
-    if target_resample is None:
-        target_resample = 600 if patch_size == 512 else 4000
+    # 3. Class-Stratified Equal-Quota Sampling: Wrap MoNuSAC in ResampledMoNuSACDataset
+    # If steps_per_epoch is provided, ensure MoNuSAC budget (batch_size // 4 per step) is covered
+    if steps_per_epoch is not None:
+        needed_monusac = steps_per_epoch * (batch_size // 4)
+        target_resample = needed_monusac if monusac_resample_size is None else max(monusac_resample_size, needed_monusac)
+    else:
+        target_resample = monusac_resample_size
 
     balanced_monusac_ds = ResampledMoNuSACDataset(
         base_dataset=raw_monusac_ds,
@@ -159,6 +153,8 @@ def build_multitask_dataloader(
         p_vflip=0.5,
         p_rot90=0.5,
         color_jitter=True,
+        p_gaussian_blur=0.2,
+        p_median_blur=0.15,
     ) if augment else None
 
     # 5. Wrap into unified MultiTaskDataset

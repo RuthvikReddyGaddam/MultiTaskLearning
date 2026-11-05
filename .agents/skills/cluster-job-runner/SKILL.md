@@ -183,3 +183,4 @@ When the user requests updating the repo or pushing scripts to GitHub:
    *(Or the current active branch via `git push origin HEAD`)*
 6. **Confirm Remote Status**:
    Ensure `git status` shows branch is clean and up-to-date with `origin/main`.
+

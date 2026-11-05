@@ -14,3 +14,4 @@ echo ">>> [2/2] Launching Cluster Evaluation..."
 bash "${SCRIPT_DIR}/run_cluster_eval.sh" "${CONFIG}"
 
 echo ">>> Pipeline Completed Successfully!"
+

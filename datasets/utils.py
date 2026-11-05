@@ -219,6 +219,47 @@ def parse_class_weights(
     return default_cell_weights, default_bg_weight
 
 
+def assign_patch_hierarchical_class(stat: Dict[str, Any]) -> int:
+    """
+    Hierarchical single-class assignment for a patch:
+      - Class 3 (Macrophage): If patch contains >= 1 macrophage nucleus (pixels > 0)
+      - Class 2 (Neutrophil): Else if patch contains >= 1 neutrophil nucleus (pixels > 0)
+      - Else majority between Class 0 (Epithelial) and Class 1 (Lymphocyte)
+      - If no nuclei are present at all, returns -1 (Background / Empty)
+    
+    Returns integer in {-1, 0, 1, 2, 3}:
+      -1: Background / No cells
+       0: Epithelial
+       1: Lymphocyte
+       2: Neutrophil
+       3: Macrophage
+    """
+    if not stat or not stat.get("has_cells", False):
+        return -1
+
+    class_pixels = stat.get("class_pixels", [])
+    # 1. Macrophage priority (Index 3)
+    if len(class_pixels) > 3 and class_pixels[3] > 0:
+        return 3
+
+    # 2. Neutrophil priority (Index 2)
+    if len(class_pixels) > 2 and class_pixels[2] > 0:
+        return 2
+
+    # 3. Majority between Epithelial (0) and Lymphocyte (1)
+    epi_px = class_pixels[0] if len(class_pixels) > 0 else 0
+    lym_px = class_pixels[1] if len(class_pixels) > 1 else 0
+
+    if epi_px == 0 and lym_px == 0:
+        # Check if any remaining pixel is present
+        classes_present = stat.get("classes_present", [])
+        if classes_present:
+            return classes_present[0]
+        return -1
+
+    return 0 if epi_px >= lym_px else 1
+
+
 def compute_patch_sampling_weights(
     samples: List[Tuple[Path, Path, Path]],
     patch_stats: Dict[str, Dict[str, Any]],

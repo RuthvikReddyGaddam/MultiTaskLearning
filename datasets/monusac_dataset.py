@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Optional, Union, Any, List, Dict
+import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -13,6 +14,7 @@ from datasets.utils import (
     compute_or_load_patch_class_stats,
     parse_class_weights,
     compute_patch_sampling_weights,
+    assign_patch_hierarchical_class,
     PatchSample,
     CLASS_NAMES,
     ALL_CLASS_NAMES,
@@ -58,6 +60,20 @@ class MoNuSACDataset(Dataset):
         self.patch_records: List[Dict[str, Any]] = [
             self.patch_stats.get(s[0].stem, {}) for s in self.samples
         ]
+        # Precompute hierarchical class assignment per patch:
+        # 0: Epithelial, 1: Lymphocyte, 2: Neutrophil, 3: Macrophage, -1: Background/Empty
+        self.patch_assigned_classes: List[int] = [
+            assign_patch_hierarchical_class(r) for r in self.patch_records
+        ]
+
+        # Build index buckets per cell class: {0: [...], 1: [...], 2: [...], 3: [...]}
+        self.class_indices: Dict[int, List[int]] = {c: [] for c in range(4)}
+        self.empty_indices: List[int] = []
+        for idx, c in enumerate(self.patch_assigned_classes):
+            if c in self.class_indices:
+                self.class_indices[c].append(idx)
+            else:
+                self.empty_indices.append(idx)
         # Precompute [N, 5] tensor of class percentages across all patches:
         # Columns: [Background %, Epithelial %, Lymphocyte %, Neutrophil %, Macrophage %]
         percents_list = [
@@ -130,6 +146,24 @@ class MoNuSACDataset(Dataset):
             num_samples=n_samples,
             replacement=replacement,
         )
+
+    def get_hierarchical_class_distribution(self) -> Dict[str, Any]:
+        """
+        Summarizes dataset-wide patch counts based on the hierarchical priority assignment:
+          - Macrophage: any patch with >= 1 macrophage nucleus
+          - Neutrophil: else any patch with >= 1 neutrophil nucleus
+          - Epithelial / Lymphocyte: else majority foreground area
+        """
+        counts = {c: len(self.class_indices[c]) for c in range(4)}
+        total = len(self.samples)
+        empty = len(self.empty_indices)
+        return {
+            "total_patches": total,
+            "empty_patches": empty,
+            "class_counts": {CLASS_NAMES[c]: counts[c] for c in range(4)},
+            "class_percents": {CLASS_NAMES[c]: (counts[c] / total * 100.0 if total > 0 else 0.0) for c in range(4)},
+            "empty_percent": (empty / total * 100.0 if total > 0 else 0.0),
+        }
 
     def get_class_distribution(self) -> Dict[str, Any]:
         """Summarizes dataset-wide class presence, counts, and average area percentages."""
@@ -244,9 +278,18 @@ class MoNuSACDataset(Dataset):
 
 class ResampledMoNuSACDataset(Dataset):
     """
-    Virtual oversampled MoNuSAC dataset for multi-task class balancing (Approach A).
-    Presents an expanded virtual length M where patches containing minority classes
-    (macrophages, neutrophils) are sampled with replacement proportional to their class weights.
+    Class-Stratified Balanced MoNuSAC dataset for multi-task learning.
+    
+    1. Partitions all patches into 4 class buckets using hierarchical priority:
+       - Macrophage (any patch with >= 1 macrophage nucleus)
+       - Neutrophil (else any patch with >= 1 neutrophil nucleus)
+       - Epithelial vs Lymphocyte (majority area)
+    2. Identifies the maximum class count N_max = max(|B_c|).
+    3. Equalizes all 4 class buckets to N_max by oversampling minority classes with replacement.
+       Virtual pool size M = 4 * N_max.
+    4. On each epoch (resample()):
+       - Shuffles each class bucket independently.
+       - Slices equal quotas from each class to fulfill the required batch/epoch sample budget.
     """
     def __init__(
         self,
@@ -257,28 +300,80 @@ class ResampledMoNuSACDataset(Dataset):
         seed: Optional[int] = None,
     ):
         self.base_dataset = base_dataset
-        # Default to 600 for 512 patches, 4000 for 256 patches, or max(len(base_dataset), 600)
-        if num_samples is not None:
-            self.num_samples = int(num_samples)
-        else:
-            self.num_samples = 600 if len(base_dataset) < 1000 else 4000
-
-        self.class_weights = class_weights
         self.generator = generator
         if seed is not None:
             self.generator = torch.Generator().manual_seed(seed)
 
-        self.sampling_weights = base_dataset.get_sampling_weights(class_weights)
+        # 1. Retrieve class buckets from base dataset
+        self.class_indices: Dict[int, List[int]] = {
+            c: list(base_dataset.class_indices[c]) for c in range(4)
+        }
+        self.raw_counts = {c: len(self.class_indices[c]) for c in range(4)}
+
+        # 2. Compute N_max across all 4 classes
+        available_counts = [self.raw_counts[c] for c in range(4) if self.raw_counts[c] > 0]
+        self.n_max = max(available_counts) if len(available_counts) > 0 else len(base_dataset)
+
+        # Fallback for empty classes (e.g. if a subset contains zero instances of a rare class)
+        for c in range(4):
+            if len(self.class_indices[c]) == 0:
+                print(f"[Warning] MoNuSAC Class {c} ({CLASS_NAMES[c]}) has 0 patches! Falling back to all patches.")
+                self.class_indices[c] = list(range(len(base_dataset)))
+
+        # 3. Equalize each bucket to N_max by oversampling with replacement
+        self.equalized_buckets: Dict[int, List[int]] = {}
+        for c in range(4):
+            indices = self.class_indices[c]
+            if len(indices) < self.n_max:
+                # Oversample with replacement to match N_max
+                repeats = (self.n_max // len(indices)) + 1
+                expanded = (indices * repeats)[:self.n_max]
+                self.equalized_buckets[c] = expanded
+            else:
+                self.equalized_buckets[c] = list(indices[:self.n_max])
+
+        # 4. Total virtual pool length
+        self.pool_size = 4 * self.n_max
+        if num_samples is not None:
+            # Round up to a multiple of 4 to ensure exact equal representation across 4 classes
+            self.num_samples = int(math.ceil(num_samples / 4.0) * 4)
+        else:
+            self.num_samples = self.pool_size
+
+        self.samples_per_class = self.num_samples // 4
+        self.sampled_indices: List[int] = []
         self.resample()
 
     def resample(self) -> None:
-        """Draws a new multinomial sample of indices for the epoch."""
-        self.sampled_indices = torch.multinomial(
-            self.sampling_weights,
-            num_samples=self.num_samples,
-            replacement=True,
-            generator=self.generator,
-        ).tolist()
+        """
+        Draws a balanced sample of indices for the epoch:
+        Shuffles each class bucket independently, takes samples_per_class from each,
+        and interleaves them cyclically so any consecutive slice has balanced classes.
+        """
+        class_samples: Dict[int, List[int]] = {}
+        for c in range(4):
+            bucket = list(self.equalized_buckets[c])
+            # Independent random permutation for each class
+            if self.generator is not None:
+                perm = torch.randperm(len(bucket), generator=self.generator).tolist()
+            else:
+                perm = torch.randperm(len(bucket)).tolist()
+            shuffled = [bucket[i] for i in perm]
+
+            # Cyclic fill if samples_per_class exceeds bucket size
+            drawn = []
+            while len(drawn) < self.samples_per_class:
+                needed = self.samples_per_class - len(drawn)
+                drawn.extend(shuffled[:needed])
+            class_samples[c] = drawn
+
+        # Interleave classes: [C0_0, C1_0, C2_0, C3_0, C0_1, C1_1, ...]
+        interleaved = []
+        for i in range(self.samples_per_class):
+            for c in range(4):
+                interleaved.append(class_samples[c][i])
+
+        self.sampled_indices = interleaved
 
     def __len__(self) -> int:
         return self.num_samples
