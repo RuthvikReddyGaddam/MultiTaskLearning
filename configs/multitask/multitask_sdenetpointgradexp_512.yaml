@@ -13,9 +13,9 @@ dataset:
   num_classes: 5
   num_workers: 2
   pin_memory: true
-  glas_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/glas_train_patch_512
-  monuseg_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monuseg_train_patch_512
-  monusac_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monusac_train_patch_512
+  glas_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/glas_train_patch_512
+  monuseg_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/monuseg_train_patch_512
+  monusac_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/monusac_train_patch_512
   monusac_resample_size: 600
   class_weights:
     background: 0.05
@@ -65,9 +65,9 @@ model:
       - 8
     pooled_sizes:
       - [32, 32]
-      - [64, 64]
-      - [64, 64]
-      - [64, 64]
+      - [32,32]
+      - [32,32]
+      - [32,32]
     dropout: 0.0
   heads:
     multitask:

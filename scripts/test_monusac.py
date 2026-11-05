@@ -45,6 +45,7 @@ from utils.test_utils import (
     load_model_for_evaluation,
     colorize_instance_mask,
     colorize_multiclass_mask,
+    assign_instance_classes_by_majority_vote,
     colorize_4class_map,
     create_tp_fp_fn_overlay,
     create_comparison_panel,
@@ -58,6 +59,61 @@ from utils.test_utils import (
 
 Image.MAX_IMAGE_PIXELS = None
 CLASS_TO_IDX = {name.lower(): idx for idx, name in enumerate(MONUSAC_CELL_NAMES)}
+
+
+def load_monusac_image(image_path: Union[str, Path]) -> np.ndarray:
+    """
+    Robustly reads a MoNuSAC sub-image (TIFF, SVS, PNG) into an RGB uint8 array [H, W, 3].
+    Aperio SVS files (and certain TIFFs with JPEG2000 / custom compression) cannot be read by PIL;
+    this loader uses tifffile and openslide as fallback mechanisms.
+    """
+    image_path = str(image_path)
+    if image_path.lower().endswith(".svs"):
+        try:
+            import tifffile
+            arr = tifffile.imread(image_path)
+            if arr.ndim == 2:
+                arr = np.stack([arr] * 3, axis=-1)
+            elif arr.ndim == 3 and arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+            elif arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
+                arr = np.transpose(arr, (1, 2, 0))
+            return np.ascontiguousarray(arr, dtype=np.uint8)
+        except Exception:
+            pass
+
+        try:
+            import openslide
+            with openslide.OpenSlide(image_path) as slide:
+                pil_img = slide.read_region((0, 0), 0, slide.dimensions).convert("RGB")
+                return np.asarray(pil_img, dtype=np.uint8)
+        except Exception:
+            pass
+
+    try:
+        with Image.open(image_path) as pil_img:
+            return np.asarray(pil_img.convert("RGB"), dtype=np.uint8)
+    except Exception:
+        pass
+
+    try:
+        import tifffile
+        arr = tifffile.imread(image_path)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        elif arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
+            arr = np.transpose(arr, (1, 2, 0))
+        return np.ascontiguousarray(arr, dtype=np.uint8)
+    except Exception:
+        pass
+
+    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if bgr is not None:
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    raise IOError(f"Could not read image file {image_path} with PIL, tifffile, openslide, or OpenCV.")
 
 
 def parse_monusac_xml(xml_path: Union[str, Path], height: int, width: int) -> np.ndarray:
@@ -199,8 +255,7 @@ def run_monusac_eval(
                 break
 
             # 1. Read full-size image
-            with Image.open(img_path) as pil_img:
-                img_rgb = np.asarray(pil_img.convert("RGB"), dtype=np.uint8)
+            img_rgb = load_monusac_image(img_path)
             h, w = img_rgb.shape[:2]
 
             # 2. Parse 4-channel ground truth XML annotations
@@ -329,8 +384,10 @@ def run_monusac_eval(
                     full_pred_bin = (full_prob >= threshold).astype(np.uint8)
                     full_pred_bin_inst = flow_to_instances(full_pred_bin, flow_vector=full_flow, min_size=min_instance_size)
 
-                # 6. Reconstruct class prediction masks
+                # 6. Reconstruct class prediction masks via per-instance majority voting
                 pred_class_masks = np.zeros((4, h, w), dtype=np.uint8)
+                pred_classes_color = np.zeros((h, w, 3), dtype=np.uint8)
+                instance_to_class = {}
                 if has_cls_head and len(patch_cls_probs) > 0:
                     full_cls_prob = stitch_multiclass_probability_map(
                         patch_probs=patch_cls_probs,
@@ -338,15 +395,12 @@ def run_monusac_eval(
                         orig_shape=orig_shape,
                         padded_shape=padded_shape,
                     )
-                    if full_cls_prob.shape[0] >= 5:
-                        fg_argmax = np.argmax(full_cls_prob[1:5], axis=0)  # 0..3
-                    else:
-                        fg_argmax = np.argmax(full_cls_prob, axis=0)
-
-                    for c in range(4):
-                        pred_class_masks[c] = ((full_pred_bin > 0) & (fg_argmax == c)).astype(np.uint8)
-
-                pred_classes_color = colorize_multiclass_mask(pred_class_masks)
+                    pred_class_masks, pred_classes_color, instance_to_class = assign_instance_classes_by_majority_vote(
+                        instances=full_pred_bin_inst,
+                        cls_prob=full_cls_prob,
+                        num_classes=4,
+                        binary_mask=full_pred_bin,
+                    )
 
             # 7. Compute binary metrics
             bin_scores = compute_binary_metrics(

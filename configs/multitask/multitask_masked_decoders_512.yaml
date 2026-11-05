@@ -13,9 +13,9 @@ dataset:
   num_classes: 5
   num_workers: 4
   pin_memory: true
-  glas_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/glas_train_patch_512
-  monuseg_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monuseg_train_patch_512
-  monusac_dir: /cluster/VAST/civalab/users/rgnm9/newimp/data/monusac_train_patch_512
+  glas_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/glas_train_patch_512
+  monuseg_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/monuseg_train_patch_512
+  monusac_dir: /cluster/VAST/civalab/users/rgnm9/multi task implementation/data/monusac_train_patch_512
   class_balance_monusac: true
   patches_per_class: 80
   class_weights:

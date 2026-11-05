@@ -421,7 +421,7 @@ def class4_to_instances(
     expand_boundary: bool = True,
     max_boundary_dist: Optional[float] = None,
     is_gland: bool = False,
-    fill_lumen: bool = True,
+    fill_lumen: bool = False,
     close_kernel: int = 25,
     original_rgb: Optional[np.ndarray] = None,
 ) -> np.ndarray:
@@ -685,6 +685,88 @@ def colorize_multiclass_mask(
             rgb[mask] = colors[c_idx]
         return rgb
     return np.zeros((arr.shape[-2], arr.shape[-1], 3), dtype=np.uint8)
+
+
+def assign_instance_classes_by_majority_vote(
+    instances: np.ndarray,
+    cls_prob: np.ndarray,
+    num_classes: int = 4,
+    binary_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, int]]:
+    """
+    Decide the phenotype class of each segmented cell instance via majority voting
+    over all pixels belonging to that instance, ensuring the entire instance has a
+    single uniform class instead of a direct pixel-wise overlay.
+
+    Args:
+        instances: [H, W] integer instance mask (0=bg, 1..N=cell instances).
+        cls_prob: [C, H, W] probability map from phenotype head:
+                  - Either 5 channels: [0: bg, 1: epi, 2: lym, 3: neu, 4: mac]
+                  - Or 4 channels: [0: epi, 1: lym, 2: neu, 3: mac]
+        num_classes: Number of foreground cell phenotype classes (default 4 for MoNuSAC).
+        binary_mask: Optional [H, W] binary mask to recover any orphan foreground pixels.
+
+    Returns:
+        pred_class_masks: [num_classes, H, W] uint8 masks where each instance belongs to exactly one class.
+        pred_classes_color: [H, W, 3] uint8 RGB image where each instance is painted with its class color.
+        instance_to_class: Dict mapping instance_id -> class_id (0..num_classes-1).
+    """
+    from scipy.ndimage import label
+
+    inst = np.asarray(instances, dtype=np.int32).copy()
+    h, w = inst.shape[-2:]
+
+    # Fallback if instances are empty but binary mask has foreground
+    if inst.max() == 0 and binary_mask is not None and binary_mask.max() > 0:
+        inst, _ = label((binary_mask > 0).astype(np.uint8))
+    elif binary_mask is not None and binary_mask.max() > 0:
+        # Check if there are orphan foreground pixels in binary_mask not in instances
+        orphan_mask = (binary_mask > 0) & (inst == 0)
+        if orphan_mask.any():
+            orphan_labeled, num_orphans = label(orphan_mask.astype(np.uint8))
+            if num_orphans > 0:
+                max_id = int(inst.max())
+                inst[orphan_mask] = orphan_labeled[orphan_mask] + max_id
+
+    pred_class_masks = np.zeros((num_classes, h, w), dtype=np.uint8)
+    instance_to_class: Dict[int, int] = {}
+
+    if cls_prob is None or inst.max() == 0:
+        colorized = colorize_multiclass_mask(pred_class_masks)
+        return pred_class_masks, colorized, instance_to_class
+
+    # Extract foreground phenotype probabilities
+    if cls_prob.shape[0] >= num_classes + 1:
+        # 5-channel output: slice channels 1..num_classes
+        fg_probs = cls_prob[1 : num_classes + 1]
+    else:
+        fg_probs = cls_prob[:num_classes]
+
+    # Pixel-wise foreground argmax
+    fg_argmax = np.argmax(fg_probs, axis=0)  # [H, W] in 0..num_classes-1
+
+    inst_ids = np.unique(inst)
+    inst_ids = inst_ids[inst_ids > 0]
+
+    for inst_id in inst_ids:
+        inst_mask = (inst == inst_id)
+        # Count pixel votes for each phenotype within this instance
+        votes = np.bincount(fg_argmax[inst_mask], minlength=num_classes)
+        max_votes = votes.max()
+        candidate_classes = np.where(votes == max_votes)[0]
+
+        if len(candidate_classes) == 1:
+            winner = int(candidate_classes[0])
+        else:
+            # Tie-break using average class probability across instance pixels
+            mean_probs = fg_probs[:, inst_mask].mean(axis=1)
+            winner = int(candidate_classes[np.argmax(mean_probs[candidate_classes])])
+
+        instance_to_class[int(inst_id)] = winner
+        pred_class_masks[winner, inst_mask] = 1
+
+    colorized = colorize_multiclass_mask(pred_class_masks)
+    return pred_class_masks, colorized, instance_to_class
 
 
 def colorize_4class_map(class4_map: np.ndarray) -> np.ndarray:
@@ -1126,21 +1208,21 @@ def predict_whole_image_multitask(
             orig_shape=orig_shape,
             padded_shape=padded_shape,
         )
-        if full_cls_prob.shape[0] >= 5:
-            fg_argmax = np.argmax(full_cls_prob[1:5], axis=0)  # 0: Epi, 1: Lym, 2: Neu, 3: Mac
-        else:
-            fg_argmax = np.argmax(full_cls_prob, axis=0)
-
         cell_bin = results["cell"]["binary_mask"] if "cell" in results else np.ones((orig_h, orig_w), dtype=np.uint8)
-        pred_class_masks = np.zeros((4, orig_h, orig_w), dtype=np.uint8)
-        for c in range(4):
-            pred_class_masks[c] = ((cell_bin > 0) & (fg_argmax == c)).astype(np.uint8)
+        cell_inst = results["cell"]["instances"] if "cell" in results else np.zeros((orig_h, orig_w), dtype=np.int32)
 
-        pheno_color = colorize_multiclass_mask(pred_class_masks)
+        pred_class_masks, pheno_color, instance_to_class = assign_instance_classes_by_majority_vote(
+            instances=cell_inst,
+            cls_prob=full_cls_prob,
+            num_classes=4,
+            binary_mask=cell_bin,
+        )
+
         results["phenotype"] = {
             "full_prob": full_cls_prob,
             "class_masks": pred_class_masks,
             "colorized_classes": pheno_color,
+            "instance_to_class": instance_to_class,
         }
 
     return results
@@ -1191,6 +1273,7 @@ __all__ = [
     "load_model_for_evaluation",
     "colorize_instance_mask",
     "colorize_multiclass_mask",
+    "assign_instance_classes_by_majority_vote",
     "colorize_4class_map",
     "create_tp_fp_fn_overlay",
     "create_comparison_panel",
