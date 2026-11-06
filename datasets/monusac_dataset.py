@@ -1,8 +1,7 @@
 # datasets/monusac_dataset.py
 
 from pathlib import Path
-from typing import Optional, Union, Any, List, Dict
-import math
+from typing import Optional, Union, Any, List, Dict, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -14,7 +13,6 @@ from datasets.utils import (
     compute_or_load_patch_class_stats,
     parse_class_weights,
     compute_patch_sampling_weights,
-    assign_patch_hierarchical_class,
     PatchSample,
     CLASS_NAMES,
     ALL_CLASS_NAMES,
@@ -60,20 +58,6 @@ class MoNuSACDataset(Dataset):
         self.patch_records: List[Dict[str, Any]] = [
             self.patch_stats.get(s[0].stem, {}) for s in self.samples
         ]
-        # Precompute hierarchical class assignment per patch:
-        # 0: Epithelial, 1: Lymphocyte, 2: Neutrophil, 3: Macrophage, -1: Background/Empty
-        self.patch_assigned_classes: List[int] = [
-            assign_patch_hierarchical_class(r) for r in self.patch_records
-        ]
-
-        # Build index buckets per cell class: {0: [...], 1: [...], 2: [...], 3: [...]}
-        self.class_indices: Dict[int, List[int]] = {c: [] for c in range(4)}
-        self.empty_indices: List[int] = []
-        for idx, c in enumerate(self.patch_assigned_classes):
-            if c in self.class_indices:
-                self.class_indices[c].append(idx)
-            else:
-                self.empty_indices.append(idx)
         # Precompute [N, 5] tensor of class percentages across all patches:
         # Columns: [Background %, Epithelial %, Lymphocyte %, Neutrophil %, Macrophage %]
         percents_list = [
@@ -146,24 +130,6 @@ class MoNuSACDataset(Dataset):
             num_samples=n_samples,
             replacement=replacement,
         )
-
-    def get_hierarchical_class_distribution(self) -> Dict[str, Any]:
-        """
-        Summarizes dataset-wide patch counts based on the hierarchical priority assignment:
-          - Macrophage: any patch with >= 1 macrophage nucleus
-          - Neutrophil: else any patch with >= 1 neutrophil nucleus
-          - Epithelial / Lymphocyte: else majority foreground area
-        """
-        counts = {c: len(self.class_indices[c]) for c in range(4)}
-        total = len(self.samples)
-        empty = len(self.empty_indices)
-        return {
-            "total_patches": total,
-            "empty_patches": empty,
-            "class_counts": {CLASS_NAMES[c]: counts[c] for c in range(4)},
-            "class_percents": {CLASS_NAMES[c]: (counts[c] / total * 100.0 if total > 0 else 0.0) for c in range(4)},
-            "empty_percent": (empty / total * 100.0 if total > 0 else 0.0),
-        }
 
     def get_class_distribution(self) -> Dict[str, Any]:
         """Summarizes dataset-wide class presence, counts, and average area percentages."""
@@ -276,113 +242,150 @@ class MoNuSACDataset(Dataset):
         return sample
 
 
-class ResampledMoNuSACDataset(Dataset):
+class ClassBalancedMoNuSACDataset(Dataset):
     """
-    Class-Stratified Balanced MoNuSAC dataset for multi-task learning.
-    
-    1. Partitions all patches into 4 class buckets using hierarchical priority:
-       - Macrophage (any patch with >= 1 macrophage nucleus)
-       - Neutrophil (else any patch with >= 1 neutrophil nucleus)
-       - Epithelial vs Lymphocyte (majority area)
-    2. Identifies the maximum class count N_max = max(|B_c|).
-    3. Equalizes all 4 class buckets to N_max by oversampling minority classes with replacement.
-       Virtual pool size M = 4 * N_max.
-    4. On each epoch (resample()):
-       - Shuffles each class bucket independently.
-       - Slices equal quotas from each class to fulfill the required batch/epoch sample budget.
+    Equal 4-Class Balanced MoNuSAC Dataset.
+    Partitions the base MoNuSAC patches into 4 distinct class pools:
+      - Class 0: Epithelial
+      - Class 1: Lymphocyte
+      - Class 2: Neutrophil
+      - Class 3: Macrophage
+
+    In every epoch (via resample()), draws exactly `patches_per_class` patches (default 80)
+    from each of the 4 classes using independent circular shuffle queues (cyclic permutation queues):
+      - Major classes (pool size >= patches_per_class): sampled without replacement until exhausted,
+        then automatically re-permuted and restarted.
+      - Minor classes (pool size < patches_per_class): sampled cyclically with continuous permutation
+        blocks so all available patches are seen uniformly before any patch repeats.
+    Total length per epoch = 4 * patches_per_class (e.g. 4 * 80 = 320 patches).
+    Guarantees strict 1:1:1:1 class equality across sampled patches.
     """
     def __init__(
         self,
         base_dataset: MoNuSACDataset,
-        num_samples: Optional[int] = None,
-        class_weights: Optional[Union[Dict[str, float], List[float]]] = None,
+        patches_per_class: int = 80,
         generator: Optional[torch.Generator] = None,
         seed: Optional[int] = None,
     ):
         self.base_dataset = base_dataset
+        self.patches_per_class = max(1, int(patches_per_class))
+        self.num_classes = 4
+        self.total_len = self.num_classes * self.patches_per_class
         self.generator = generator
         if seed is not None:
             self.generator = torch.Generator().manual_seed(seed)
 
-        # 1. Retrieve class buckets from base dataset
-        self.class_indices: Dict[int, List[int]] = {
-            c: list(base_dataset.class_indices[c]) for c in range(4)
-        }
-        self.raw_counts = {c: len(self.class_indices[c]) for c in range(4)}
+        # Build class index pools
+        # 0: Epithelial, 1: Lymphocyte, 2: Neutrophil, 3: Macrophage
+        self.class_indices: List[List[int]] = [[] for _ in range(4)]
+        for i, rec in enumerate(base_dataset.patch_records):
+            classes = rec.get("classes_present", [])
+            pix = rec.get("class_pixels", [0, 0, 0, 0])
+            for c in range(4):
+                if c in classes or (len(pix) > c and pix[c] > 0):
+                    self.class_indices[c].append(i)
 
-        # 2. Compute N_max across all 4 classes
-        available_counts = [self.raw_counts[c] for c in range(4) if self.raw_counts[c] > 0]
-        self.n_max = max(available_counts) if len(available_counts) > 0 else len(base_dataset)
-
-        # Fallback for empty classes (e.g. if a subset contains zero instances of a rare class)
+        # Fallback: if any class has 0 patches (e.g. dummy test fixture), use all available indices
+        n_base = len(base_dataset)
         for c in range(4):
             if len(self.class_indices[c]) == 0:
-                print(f"[Warning] MoNuSAC Class {c} ({CLASS_NAMES[c]}) has 0 patches! Falling back to all patches.")
-                self.class_indices[c] = list(range(len(base_dataset)))
+                self.class_indices[c] = list(range(n_base))
 
-        # 3. Equalize each bucket to N_max by oversampling with replacement
-        self.equalized_buckets: Dict[int, List[int]] = {}
+        self.class_pool_sizes = [len(idx_list) for idx_list in self.class_indices]
+
+        # Circular shuffle queues and active pointers for the 4 classes
+        self.queues: List[List[int]] = []
+        self.ptrs: List[int] = [0] * 4
         for c in range(4):
-            indices = self.class_indices[c]
-            if len(indices) < self.n_max:
-                # Oversample with replacement to match N_max
-                repeats = (self.n_max // len(indices)) + 1
-                expanded = (indices * repeats)[:self.n_max]
-                self.equalized_buckets[c] = expanded
-            else:
-                self.equalized_buckets[c] = list(indices[:self.n_max])
+            perm = self._get_permutation(len(self.class_indices[c]))
+            self.queues.append([self.class_indices[c][p] for p in perm])
 
-        # 4. Total virtual pool length
-        self.pool_size = 4 * self.n_max
-        if num_samples is not None:
-            # Round up to a multiple of 4 to ensure exact equal representation across 4 classes
-            self.num_samples = int(math.ceil(num_samples / 4.0) * 4)
-        else:
-            self.num_samples = self.pool_size
-
-        self.samples_per_class = self.num_samples // 4
         self.sampled_indices: List[int] = []
+        self.sampled_classes: List[int] = []
         self.resample()
 
+    def _get_permutation(self, length: int) -> List[int]:
+        if self.generator is not None:
+            return torch.randperm(length, generator=self.generator).tolist()
+        return torch.randperm(length).tolist()
+
     def resample(self) -> None:
-        """
-        Draws a balanced sample of indices for the epoch:
-        Shuffles each class bucket independently, takes samples_per_class from each,
-        and interleaves them cyclically so any consecutive slice has balanced classes.
-        """
-        class_samples: Dict[int, List[int]] = {}
+        """Draws exactly `patches_per_class` patches for each of the 4 classes."""
+        drawn_indices: List[int] = []
+        drawn_classes: List[int] = []
+
         for c in range(4):
-            bucket = list(self.equalized_buckets[c])
-            # Independent random permutation for each class
-            if self.generator is not None:
-                perm = torch.randperm(len(bucket), generator=self.generator).tolist()
-            else:
-                perm = torch.randperm(len(bucket)).tolist()
-            shuffled = [bucket[i] for i in perm]
+            c_pool_size = len(self.class_indices[c])
+            c_drawn: List[int] = []
 
-            # Cyclic fill if samples_per_class exceeds bucket size
-            drawn = []
-            while len(drawn) < self.samples_per_class:
-                needed = self.samples_per_class - len(drawn)
-                drawn.extend(shuffled[:needed])
-            class_samples[c] = drawn
+            while len(c_drawn) < self.patches_per_class:
+                needed = self.patches_per_class - len(c_drawn)
+                available = c_pool_size - self.ptrs[c]
 
-        # Interleave classes: [C0_0, C1_0, C2_0, C3_0, C0_1, C1_1, ...]
-        interleaved = []
-        for i in range(self.samples_per_class):
-            for c in range(4):
-                interleaved.append(class_samples[c][i])
+                if available >= needed:
+                    slice_end = self.ptrs[c] + needed
+                    c_drawn.extend(self.queues[c][self.ptrs[c]:slice_end])
+                    self.ptrs[c] = slice_end
+                    if self.ptrs[c] == c_pool_size:
+                        # Queue exhausted: generate fresh permutation and reset pointer
+                        perm = self._get_permutation(c_pool_size)
+                        self.queues[c] = [self.class_indices[c][p] for p in perm]
+                        self.ptrs[c] = 0
+                else:
+                    # Take remainder of current queue
+                    c_drawn.extend(self.queues[c][self.ptrs[c]:])
+                    # Queue exhausted: generate fresh permutation and reset pointer
+                    perm = self._get_permutation(c_pool_size)
+                    self.queues[c] = [self.class_indices[c][p] for p in perm]
+                    self.ptrs[c] = 0
 
-        self.sampled_indices = interleaved
+            drawn_indices.extend(c_drawn)
+            drawn_classes.extend([c] * self.patches_per_class)
+
+        # Interleave/shuffle across classes uniformly
+        perm_all = self._get_permutation(len(drawn_indices))
+        self.sampled_indices = [drawn_indices[p] for p in perm_all]
+        self.sampled_classes = [drawn_classes[p] for p in perm_all]
 
     def __len__(self) -> int:
-        return self.num_samples
+        return self.total_len
 
     def __getitem__(self, idx: int) -> PatchSample:
         base_idx = self.sampled_indices[idx]
         sample = self.base_dataset[base_idx]
         if isinstance(sample, dict):
+            sample["target_class"] = self.sampled_classes[idx]
             sample["resampled_idx"] = idx
             sample["base_idx"] = base_idx
         return sample
+
+    def get_class_distribution(self) -> Dict[str, Any]:
+        """Summarizes class distribution across the equal 4-class pseudo-dataset."""
+        class_counts = {
+            "Epithelial": self.patches_per_class,
+            "Lymphocyte": self.patches_per_class,
+            "Neutrophil": self.patches_per_class,
+            "Macrophage": self.patches_per_class,
+        }
+        return {
+            "total_patches": self.total_len,
+            "patches_per_class": self.patches_per_class,
+            "class_patch_counts": class_counts,
+            "class_pool_sizes": {
+                CLASS_NAMES[i]: self.class_pool_sizes[i] for i in range(4)
+            },
+        }
+
+    def print_class_distribution(self) -> None:
+        """Prints a formatted summary table of the equal 4-class distribution."""
+        print("\n" + "=" * 70)
+        print(f"Class-Balanced MoNuSAC Dataset ({self.total_len} total pseudo-patches per epoch):")
+        print(f"{'Class':<14} | {'Available Pool':<16} | {'Sampled / Epoch':<16} | {'Equal Ratio'}")
+        print("-" * 70)
+        for i, name in enumerate(CLASS_NAMES):
+            pool_sz = self.class_pool_sizes[i]
+            sampled = self.patches_per_class
+            print(f"{name:<14} | {pool_sz:6d} patches   | {sampled:6d} patches   | 25.0% (1/4)")
+        print("=" * 70 + "\n")
+
 

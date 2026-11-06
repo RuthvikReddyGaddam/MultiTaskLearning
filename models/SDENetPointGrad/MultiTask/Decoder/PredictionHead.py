@@ -296,35 +296,9 @@ class MultiTaskPredictionHead(nn.Module):
             return out
 
         # =========================================================
-        # 2. Slice-based conditional evaluation during training
+        # 2. Mask-based conditional evaluation during training
         # =========================================================
         if task_ids is not None:
-            B = x.shape[0]
-            half = B // 2
-            q3 = half + B // 4
-            # Fast deterministic multiple-of-8 contract (2:1:1 split)
-            if (
-                B % 8 == 0
-                and (task_ids[:half] == 0).all()
-                and (task_ids[half:q3] == 1).all()
-                and (task_ids[q3:] == 2).all()
-            ):
-                gland_seg = self.gland_seg(x[:half])
-                gland_neg = self.gland_seg(x[half:])  # Cell patches for negative background supervision
-                cell_seg = self.cell_seg(x[half:])
-                cell_class = self.cell_class(x[q3:])
-                return {
-                    "gland_seg": gland_seg,
-                    "glas_seg": gland_seg,
-                    "gland_neg": gland_neg,
-                    "glas_neg": gland_neg,
-                    "cell_seg": cell_seg,
-                    "monuseg_seg": cell_seg[: B // 4],
-                    "monusac_seg": cell_seg[B // 4 :],
-                    "cell_class": cell_class,
-                    "monusac_class": cell_class,
-                }
-
             is_gland = (task_ids == 0)
             is_cell = (task_ids == 1) | (task_ids == 2)
             is_monusac = (task_ids == 2)

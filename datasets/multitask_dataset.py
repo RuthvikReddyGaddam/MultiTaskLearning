@@ -7,7 +7,10 @@ from torch.utils.data import Dataset, DataLoader
 
 from datasets.glas_dataset import GlasDataset
 from datasets.monuseg_dataset import MoNuSegDataset
-from datasets.monusac_dataset import MoNuSACDataset, ResampledMoNuSACDataset
+from datasets.monusac_dataset import (
+    MoNuSACDataset,
+    ClassBalancedMoNuSACDataset,
+)
 from datasets.multitask_sampler import EqualTaskBatchSampler
 from datasets.multitask_collate import MultiTaskCollateFn
 from datasets.multitask_augment import MultiTaskSpatialAugmentor
@@ -28,7 +31,7 @@ class MultiTaskDataset(Dataset):
         self,
         glas_dataset: GlasDataset,
         monuseg_dataset: MoNuSegDataset,
-        monusac_dataset: Union[MoNuSACDataset, ResampledMoNuSACDataset],
+        monusac_dataset: Union[MoNuSACDataset, ClassBalancedMoNuSACDataset],
         spatial_augmentor: Optional[MultiTaskSpatialAugmentor] = None,
     ):
         self.glas_dataset = glas_dataset
@@ -92,24 +95,22 @@ def build_multitask_dataloader(
     num_workers: int = 4,
     shuffle: bool = True,
     augment: bool = True,
-    steps_per_epoch: Optional[int] = None,
+    steps_per_epoch: Optional[int] = 160,
     ignore_index: int = -1,
     pin_memory: bool = True,
-    monusac_resample_size: Optional[int] = None,
-    monusac_class_weights: Optional[Dict[str, float]] = None,
+    class_balance_monusac: bool = True,
+    patches_per_class: int = 80,
     class_weights: Optional[Dict[str, float]] = None,
 ) -> DataLoader:
     """
     Factory function to construct a balanced Multi-Task DataLoader.
     
     Guarantees:
-      - Exactly batch_size // 3 samples from GLaS, MoNuSeg, and MoNuSAC in EVERY batch.
-      - Approach A: MoNuSAC is wrapped in ResampledMoNuSACDataset with minority-class oversampling.
+      - Exactly 2:1:1 split (half GLaS, quarter MoNuSeg, quarter MoNuSAC) per batch.
+      - Equal 4-class representation for MoNuSAC (80 patches per class: Epi, Lym, Neu, Mac = 1:1:1:1).
       - Orientation-preserving vector field rotations on 2-channel flow vectors.
       - Padded class maps (-1) and boolean task indicator masks for decoupled heads.
     """
-    if monusac_class_weights is None and class_weights is not None:
-        monusac_class_weights = class_weights
     # 1. Resolve directories (defaults to data/<name>_train_patch_<patch_size>)
     if glas_dir is None:
         glas_dir = PROJECT_ROOT / "data" / f"glas_train_patch_{patch_size}"
@@ -129,23 +130,16 @@ def build_multitask_dataloader(
     # 2. Instantiate individual datasets (transforms handled by MultiTaskSpatialAugmentor)
     glas_ds = GlasDataset(data_dir=glas_dir, transform=None)
     monuseg_ds = MoNuSegDataset(data_dir=monuseg_dir, transform=None)
+    raw_monusac_ds = MoNuSACDataset(data_dir=monusac_dir, transform=None, class_weights=class_weights)
 
-
-    raw_monusac_ds = MoNuSACDataset(data_dir=monusac_dir, transform=None, class_weights=monusac_class_weights)
-
-    # 3. Class-Stratified Equal-Quota Sampling: Wrap MoNuSAC in ResampledMoNuSACDataset
-    # If steps_per_epoch is provided, ensure MoNuSAC budget (batch_size // 4 per step) is covered
-    if steps_per_epoch is not None:
-        needed_monusac = steps_per_epoch * (batch_size // 4)
-        target_resample = needed_monusac if monusac_resample_size is None else max(monusac_resample_size, needed_monusac)
+    # 3. MoNuSAC Dataset configuration (Strict equal 4-class circular queue sampling)
+    if class_balance_monusac:
+        sac_dataset = ClassBalancedMoNuSACDataset(
+            base_dataset=raw_monusac_ds,
+            patches_per_class=patches_per_class,
+        )
     else:
-        target_resample = monusac_resample_size
-
-    balanced_monusac_ds = ResampledMoNuSACDataset(
-        base_dataset=raw_monusac_ds,
-        num_samples=target_resample,
-        class_weights=monusac_class_weights,
-    )
+        sac_dataset = raw_monusac_ds
 
     # 4. Setup spatial augmentor
     augmentor = MultiTaskSpatialAugmentor(
@@ -153,15 +147,13 @@ def build_multitask_dataloader(
         p_vflip=0.5,
         p_rot90=0.5,
         color_jitter=True,
-        p_gaussian_blur=0.2,
-        p_median_blur=0.15,
     ) if augment else None
 
     # 5. Wrap into unified MultiTaskDataset
     multitask_ds = MultiTaskDataset(
         glas_dataset=glas_ds,
         monuseg_dataset=monuseg_ds,
-        monusac_dataset=balanced_monusac_ds,
+        monusac_dataset=sac_dataset,
         spatial_augmentor=augmentor,
     )
 
@@ -177,13 +169,17 @@ def build_multitask_dataloader(
     collate_fn = MultiTaskCollateFn(ignore_index=ignore_index, num_classes=5, check_equal_split=True)
 
     # 8. Construct and return DataLoader
-    loader = DataLoader(
-        dataset=multitask_ds,
-        batch_sampler=batch_sampler,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
+    loader_kwargs: Dict[str, Any] = {
+        "dataset": multitask_ds,
+        "batch_sampler": batch_sampler,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
 
+    loader = DataLoader(**loader_kwargs)
     return loader
 

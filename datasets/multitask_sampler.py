@@ -30,6 +30,7 @@ class EqualTaskBatchSampler(Sampler[List[int]]):
         drop_last: bool = False,
         steps_per_epoch: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
+        shuffle_within_batch: Optional[bool] = None,
     ):
         if len(dataset_lengths) != 3:
             raise ValueError(f"EqualTaskBatchSampler requires exactly 3 dataset lengths, got {len(dataset_lengths)}")
@@ -37,9 +38,9 @@ class EqualTaskBatchSampler(Sampler[List[int]]):
             if l <= 0:
                 raise ValueError(f"Dataset length for dataset {i} must be > 0, got {l}")
 
-        if batch_size % 8 != 0:
+        if batch_size % 4 != 0:
             raise ValueError(
-                f"batch_size ({batch_size}) must be a multiple of 8 (e.g. 8, 16, 24) to ensure "
+                f"batch_size ({batch_size}) must be a multiple of 4 (e.g. 4, 8, 16) to ensure "
                 f"2:1:1 task sampling (half GLaS, quarter MoNuSeg, quarter MoNuSAC)."
             )
 
@@ -51,6 +52,7 @@ class EqualTaskBatchSampler(Sampler[List[int]]):
         self.task_k = [self.k_glas, self.k_monuseg, self.k_monusac]
         self.k = self.k_glas
         self.shuffle = shuffle
+        self.shuffle_within_batch = shuffle if shuffle_within_batch is None else shuffle_within_batch
         self.drop_last = drop_last
         self.generator = generator
 
@@ -118,6 +120,10 @@ class EqualTaskBatchSampler(Sampler[List[int]]):
 
                 # Convert local indices to global concatenated indices
                 batch.extend([idx + offset for idx in d_samples])
+
+            if self.shuffle_within_batch:
+                perm = torch.randperm(len(batch), generator=self.generator).tolist()
+                batch = [batch[p] for p in perm]
 
             yield batch
 

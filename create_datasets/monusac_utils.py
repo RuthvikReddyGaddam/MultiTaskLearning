@@ -6,7 +6,23 @@ import cv2
 import numpy as np
 from PIL import Image
 from scipy.ndimage import distance_transform_edt, find_objects, gaussian_filter
-from skimage.morphology import skeletonize
+try:
+    from skimage.morphology import skeletonize
+except ImportError:
+    # Morphological thinning fallback when scikit-image is not installed
+    def skeletonize(image: np.ndarray) -> np.ndarray:
+        img = (image > 0).astype(np.uint8)
+        skel = np.zeros(img.shape, np.uint8)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        while True:
+            eroded = cv2.erode(img, element)
+            temp = cv2.dilate(eroded, element)
+            temp = cv2.subtract(img, temp)
+            skel = cv2.bitwise_or(skel, temp)
+            img = eroded.copy()
+            if cv2.countNonZero(img) == 0:
+                break
+        return skel > 0
 import xml.etree.ElementTree as ET
 
 Image.MAX_IMAGE_PIXELS = None
@@ -69,12 +85,10 @@ def save_subimage_data(
     target_3class: Optional[np.ndarray] = None,
     target_4class: Optional[np.ndarray] = None,
 ) -> None:
-    """Saves image.npy, mask.npy, binary_mask.npy, and optional full-size targets into subimage_dir."""
+    """Saves image.npy and 4-channel instance mask.npy (integer IDs 1..N per class) into subimage_dir."""
     subimage_dir.mkdir(parents=True, exist_ok=True)
     np.save(subimage_dir / "image.npy", image)
-    np.save(subimage_dir / "mask.npy", mask)
-    bin_mask = (mask > 0).any(axis=0).astype(np.float32) if mask.ndim == 3 else (mask > 0).astype(np.float32)
-    np.save(subimage_dir / "binary_mask.npy", bin_mask)
+    np.save(subimage_dir / "mask.npy", mask.astype(np.int32))
     if sdf is not None:
         np.save(subimage_dir / "sdf.npy", sdf)
     if hv_map is not None:
@@ -188,20 +202,19 @@ def compute_instance_sdf(instance_mask: np.ndarray) -> np.ndarray:
 def compute_4class_target_with_bottom_hat(
     instance_mask: np.ndarray,
     kernel_size: int = 5,
-    boundary_width: int = 1,
+    touching_radius: int = 1,
 ) -> np.ndarray:
     """
-    Computes a 4-channel target map using per-instance boundary/interior extraction
-    and Bottom-Hat transform for inter-cellular gap cleft isolation:
+    Computes a 4-channel target map strictly aligned with the J4 formulation (Guerrero-Pena et al.):
       0: Background
-      1: Interior (Core seed)
-      2: Boundary (Cell contour ring)
-      3: Gap (Inter-cellular clefts/valleys via Bottom-Hat: Closing(M) - M)
+      1: Cell Interior (M_cell)
+      2: Touching Region (Gamma: cell pixels directly in contact with a distinct instance)
+      3: Gap (Inter-cellular crevices between distinct instances via Bottom-Hat: Closing(M) - M)
 
     Args:
         instance_mask: [H, W] (or [4, H, W]) integer instance mask.
         kernel_size: Structuring element diameter for bottom-hat transform (default: 5).
-        boundary_width: Width of instance contour boundary in pixels (default: 1).
+        touching_radius: Radius for expanding touching boundary seams within cell bodies (default: 1).
 
     Returns:
         target_4class: [H, W] integer array with values in {0, 1, 2, 3}.
@@ -224,12 +237,36 @@ def compute_4class_target_with_bottom_hat(
         return target
 
     # 1. Bottom-Hat Transform on binary mask: BTH(M) = Closing(M) - M
+    # Gaps are strictly background pixels in valleys/clefts (instance_mask == 0)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     bottom_hat = cv2.morphologyEx(bin_mask, cv2.MORPH_BLACKHAT, kernel)
-    gap_mask = (bottom_hat > 0)
+    raw_gap_mask = (bottom_hat > 0) & (instance_mask == 0)
 
-    # 2. Add touching contact seams between distinct instances to gap_mask
+    # Eliminate intra-nuclear clefts (indentations of the SAME nucleus):
+    # A gap pixel is only a true INTER-instance gap if it lies between at least TWO DIFFERENT cell instances.
+    gap_mask = np.zeros((h, w), dtype=bool)
+    if np.any(raw_gap_mask):
+        has_instance = (instance_mask > 0)
+        if np.any(has_instance):
+            _, (nearest_y, nearest_x) = distance_transform_edt(~has_instance, return_indices=True)
+            nearest_id_map = instance_mask[nearest_y, nearest_x]
+
+            gap_candidates = np.argwhere(raw_gap_mask)
+            rad = max(2, kernel_size // 2)
+            for gy, gx in gap_candidates:
+                y0 = max(0, gy - rad)
+                y1 = min(h, gy + rad + 1)
+                x0 = max(0, gx - rad)
+                x1 = min(w, gx + rad + 1)
+
+                local_ids = nearest_id_map[y0:y1, x0:x1]
+                unique_local_ids = np.unique(local_ids[local_ids > 0])
+                if len(unique_local_ids) >= 2:
+                    gap_mask[gy, gx] = True
+
+    # 2. Identify contact seams between distinct cell instances (Touching Region)
     slices = find_objects(instance_mask)
+    seam = np.zeros((h, w), dtype=bool)
     if len(slices) > 1:
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
             y_src = slice(max(0, -dy), min(h, h - dy))
@@ -240,44 +277,37 @@ def compute_4class_target_with_bottom_hat(
             src_vals = instance_mask[y_src, x_src]
             dst_vals = instance_mask[y_dst, x_dst]
 
-            seam = (src_vals > 0) & (dst_vals > 0) & (src_vals != dst_vals)
-            gap_mask[y_src, x_src] |= seam
+            touch = (src_vals > 0) & (dst_vals > 0) & (src_vals != dst_vals)
+            seam[y_src, x_src] |= touch
 
-    # 3. For each instance, compute interior (class 1) and boundary (class 2) per-instance
-    k_erode = np.ones((3, 3), np.uint8) if boundary_width == 1 else cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * boundary_width + 1, 2 * boundary_width + 1))
+    # 3. Expand touching region by touching_radius within the cell foreground
+    if np.any(seam) and touching_radius > 1:
+        k_touch = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * touching_radius + 1, 2 * touching_radius + 1))
+        touching_expanded = cv2.dilate(seam.astype(np.uint8), k_touch)
+        touching_mask = (touching_expanded > 0) & (bin_mask > 0)
+    else:
+        touching_mask = seam
 
-    for inst_id, sl in enumerate(slices, start=1):
-        if sl is None:
-            continue
-        obj_crop = (instance_mask[sl] == inst_id)
-        if not np.any(obj_crop):
-            continue
+    # 4. Cell interior: cell body pixels not in touching region
+    interior_mask = (bin_mask > 0) & (~touching_mask)
 
-        target_sl = target[sl]
+    # Degeneracy check: ensure every instance preserves at least 1 interior pixel
+    if len(slices) > 0:
+        for inst_id, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            inst_crop = (instance_mask[sl] == inst_id)
+            if not np.any(inst_crop):
+                continue
+            if not np.any(interior_mask[sl] & inst_crop):
+                edt = distance_transform_edt(inst_crop)
+                peak_y, peak_x = np.unravel_index(np.argmax(edt), inst_crop.shape)
+                interior_mask[sl][peak_y, peak_x] = True
+                touching_mask[sl][peak_y, peak_x] = False
 
-        if boundary_width > 0:
-            eroded = cv2.erode(obj_crop.astype(np.uint8), k_erode, iterations=1)
-            boundary = obj_crop & (eroded == 0)
-
-            # Degeneracy check: ensure small instances retain at least 1 interior seed pixel
-            if not np.any(eroded):
-                edt = distance_transform_edt(obj_crop)
-                peak_y, peak_x = np.unravel_index(np.argmax(edt), obj_crop.shape)
-                eroded[peak_y, peak_x] = 1
-                boundary[peak_y, peak_x] = False
-
-            target_sl[boundary] = 2
-            target_sl[eroded > 0] = 1
-        else:
-            target_sl[obj_crop] = 1
-
-        target[sl] = target_sl
-
-    # 4. Gaps take priority at contact/valley locations (class 3)
+    target[interior_mask] = 1
+    target[touching_mask] = 2
     target[gap_mask] = 3
-
-    # Ensure background is 0
-    target[(instance_mask == 0) & (~gap_mask)] = 0
 
     return target
 
@@ -1091,12 +1121,12 @@ def save_full_image_preview(
     rgb_4ch = create_4channel_rgb(target_4class)
     axes[1, 3].imshow(rgb_4ch)
     n_gap_pixels = int(np.sum(target_4class == 3))
-    axes[1, 3].set_title(f"8. 4-Class Target (Gap Clefts={n_gap_pixels} px)", fontsize=11, fontweight="bold")
+    axes[1, 3].set_title(f"8. J4 4-Class Target (Gap Clefts={n_gap_pixels} px)", fontsize=11, fontweight="bold")
     axes[1, 3].axis("off")
     legend_4ch = [
         Patch(facecolor="#191e2d", edgecolor="gray", label="0: Background"),
         Patch(facecolor="#1ea0f0", edgecolor="none", label="1: Interior"),
-        Patch(facecolor="#32dc5a", edgecolor="none", label="2: Boundary"),
+        Patch(facecolor="#32dc5a", edgecolor="none", label="2: Touching Region"),
         Patch(facecolor="#f5232d", edgecolor="none", label="3: Gap Cleft"),
     ]
     axes[1, 3].legend(handles=legend_4ch, loc="lower right", fontsize=8, framealpha=0.85)
@@ -1169,7 +1199,7 @@ def save_full_image_preview(
     else:
         overlay_4ch = overlay_4channel_on_rgb(image, target_4class, alpha=0.5)
         axes[2, 3].imshow(overlay_4ch)
-        axes[2, 3].set_title("12. 4-Class Target Overlaid on RGB", fontsize=11, fontweight="bold")
+        axes[2, 3].set_title("12. J4 4-Class Target Overlaid on RGB", fontsize=11, fontweight="bold")
 
     axes[2, 3].axis("off")
 

@@ -52,10 +52,64 @@ class TestTrainer8Batch(unittest.TestCase):
         self.assertIn("glas_bin_dice", metrics)
         self.assertIn("monuseg_bin_dice", metrics)
         self.assertIn("monusac_bin_dice", metrics)
-        self.assertIn("loss_glas_neg", metrics)
-        self.assertIn("glas_neg_bg_ratio", metrics)
-        self.assertGreaterEqual(metrics["glas_neg_bg_ratio"], 0.0)
-        self.assertLessEqual(metrics["glas_neg_bg_ratio"], 1.0)
+        self.assertIn("loss_monusac_cls_ce", metrics)
+        self.assertIn("loss_monusac_cls_dice", metrics)
+
+    def test_train_step_gradient_accumulation_4batch(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = Model(approach="4class_j", num_gland_classes=4, num_cell_classes=4, num_classification_classes=5).to(device)
+        criterion = MultiTaskLoss(approach="4class_j").to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+        # Batch 1 (4 patches: 2 GLaS, 1 MoNuSeg, 1 MoNuSAC)
+        b1 = {
+            "image": torch.randn(4, 3, 64, 64, device=device),
+            "target_4class": torch.randint(0, 4, (4, 64, 64), device=device),
+            "binary_mask": torch.randint(0, 2, (4, 1, 64, 64), device=device).float(),
+            "class_map": torch.full((4, 64, 64), -1, dtype=torch.long, device=device),
+            "task_id": torch.tensor([0, 0, 1, 2], device=device),
+            "is_gland": torch.tensor([True, True, False, False], device=device),
+            "is_monuseg": torch.tensor([False, False, True, False], device=device),
+            "is_monusac": torch.tensor([False, False, False, True], device=device),
+            "patch_names": [f"p_{i}" for i in range(4)],
+        }
+        b1["class_map"][3:4] = torch.randint(0, 5, (1, 64, 64), device=device)
+
+        # Batch 2 (4 patches: 2 GLaS, 1 MoNuSeg, 1 MoNuSAC)
+        b2 = {
+            "image": torch.randn(4, 3, 64, 64, device=device),
+            "target_4class": torch.randint(0, 4, (4, 64, 64), device=device),
+            "binary_mask": torch.randint(0, 2, (4, 1, 64, 64), device=device).float(),
+            "class_map": torch.full((4, 64, 64), -1, dtype=torch.long, device=device),
+            "task_id": torch.tensor([0, 0, 1, 2], device=device),
+            "is_gland": torch.tensor([True, True, False, False], device=device),
+            "is_monuseg": torch.tensor([False, False, True, False], device=device),
+            "is_monusac": torch.tensor([False, False, False, True], device=device),
+            "patch_names": [f"p_{i+4}" for i in range(4)],
+        }
+        b2["class_map"][3:4] = torch.randint(0, 5, (1, 64, 64), device=device)
+
+        class DummyLoader2:
+            def __iter__(self):
+                return iter([b1, b2])
+            def __len__(self):
+                return 2
+
+        trainer = MultiTaskTrainer(
+            model=model,
+            train_loader=DummyLoader2(),
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            config={"training": {"epochs": 1, "batch_size": 4, "gradient_accumulation_steps": 2}},
+            exp_dir="checkpoints/dummy_test_4batch_accum",
+        )
+        self.assertEqual(trainer.grad_accum_steps, 2)
+        metrics = trainer.train_one_epoch()
+        self.assertIn("loss", metrics)
+        self.assertIn("glas_bin_dice", metrics)
+        self.assertIn("monuseg_bin_dice", metrics)
+        self.assertIn("monusac_bin_dice", metrics)
 
 
 if __name__ == "__main__":

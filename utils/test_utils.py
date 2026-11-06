@@ -415,80 +415,84 @@ def extract_model_outputs(
     return seg, cls_
 
 
-def class4_to_instances(
+def j4_reconstruct_instances(
     seg_logits: Union[np.ndarray, torch.Tensor],
     min_size: int = 10,
-    expand_boundary: bool = True,
-    max_boundary_dist: Optional[float] = None,
+    gap_uncertainty_threshold: float = 0.35,
     is_gland: bool = False,
     fill_lumen: bool = False,
     close_kernel: int = 25,
     original_rgb: Optional[np.ndarray] = None,
+    **kwargs,
 ) -> np.ndarray:
     """
-    Converts 4-class segmentation logits/map [4, H, W] or [H, W] into separated instance labels:
-      0: Background
-      1: Interior (Core)
-      2: Boundary (Contour ring)
-      3: Gap (Inter-cellular clefts/valleys via Bottom-Hat transform)
+    Exact Parameter-Free J4 MAP Instance Reconstruction Pipeline (Guerrero-Pena et al.):
+      Channel 0: Background
+      Channel 1: Cell Interior (M_cell)
+      Channel 2: Touching Region (cell pixels touching another cell instance, Gamma)
+      Channel 3: Gap (background pixels in narrow spaces between cells via Bottom-Hat)
 
-    Instance separation:
-      1. Connected components on Interior cores (class 1).
-      2. For glands (is_gland=True): safely reclaims interior white lumina using
-         per-instance boundary closing and optical-white saturation gating (preventing
-         false-positive filling of pink stroma or inter-gland background).
-      3. Gap (class 3) and Background (class 0) act as non-instance barriers.
-      4. Expansion of interior cores into adjacent Boundary pixels (class 2) via distance transform.
-         Gap pixels (class 3) are never absorbed, preserving physical separation between touching cells.
+    Step 1 — Input: 4-channel probability map Z in R^{4 x H x W}
+    Step 2 — Apply Maximum A Posteriori (MAP): h_hat(p) = argmax_{k in {0,1,2,3}} Z_k(p)
+    Step 3 — Handle Gap class:
+             - Confident gaps (Z_3 >= gap_uncertainty_threshold) -> assigned to Background (0)
+             - Ambiguous gaps (Z_3 < gap_uncertainty_threshold) -> argmax_{k in {0,1,2}} Z_k(p)
+    Step 4 — Connected-component labeling on cell interiors M_cell(p) = [h_hat(p) == 1]
+    Step 5 — Assign touching pixels (h_hat(p) == 2) to their closest labeled cell instance
+             via Euclidean distance transform (Equation 4, Guerrero-Pena et al.).
+    Step 6 — Produce final instance mask g_hat in Z_{>=0}^{H x W}
     """
     from scipy.ndimage import distance_transform_edt, binary_fill_holes
 
     if isinstance(seg_logits, torch.Tensor):
-        if seg_logits.ndim == 3 and seg_logits.shape[0] >= 3:
-            pred_class = seg_logits.argmax(dim=0).cpu().numpy()
-        elif seg_logits.ndim == 4 and seg_logits.shape[1] >= 3:
-            pred_class = seg_logits[0].argmax(dim=0).cpu().numpy()
-        else:
-            pred_class = seg_logits.squeeze().cpu().numpy()
+        probs = seg_logits.detach().cpu().numpy()
     else:
-        seg_np = np.asarray(seg_logits)
-        if seg_np.ndim == 3 and seg_np.shape[0] >= 3:
-            pred_class = np.argmax(seg_np, axis=0)
-        else:
-            pred_class = seg_np
+        probs = np.asarray(seg_logits, dtype=np.float32)
 
-    interior = (pred_class == 1).astype(np.uint8)
+    if probs.ndim == 4:
+        probs = probs[0]
 
-    # Gland-specific safe lumen reclamation
+    if probs.ndim == 3 and probs.shape[0] == 4:
+        # Step 2: MAP classification
+        map_h = np.argmax(probs, axis=0)  # [H, W] in {0, 1, 2, 3}
+
+        # Step 3: Handle Gap Class
+        is_gap = (map_h == 3)
+        if np.any(is_gap):
+            # Default: confident gaps remain background (0)
+            map_h[is_gap] = 0
+
+            # Ambiguous/uncertain gap pixels are reassigned to argmax over {0, 1, 2}
+            uncertain_gap = is_gap & (probs[3] < gap_uncertainty_threshold)
+            if np.any(uncertain_gap):
+                reassigned = np.argmax(probs[:3, uncertain_gap], axis=0)
+                map_h[uncertain_gap] = reassigned
+    elif probs.ndim == 2:
+        map_h = probs.astype(np.int64)
+    else:
+        raise ValueError(f"Expected 4-channel [4, H, W] or argmax [H, W], got {probs.shape}")
+
+    # Step 4: Connected-component labeling on cell interiors (class 1)
+    interior = (map_h == 1).astype(np.uint8)
+
+    # Gland-specific safe lumen reclamation if requested
     if is_gland and fill_lumen:
-        fg_mask = ((pred_class == 1) | (pred_class == 2)).astype(np.uint8)
+        fg_mask = ((map_h == 1) | (map_h == 2)).astype(np.uint8)
         if close_kernel > 1:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
             closed_fg = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k)
         else:
             closed_fg = fg_mask
-
-        # Identify background holes enclosed by the gland boundary
-        enclosed_holes = binary_fill_holes(closed_fg > 0) & (pred_class == 0)
-
-        # Apply optical-white gating if original image is provided:
-        # True lumens are optical white (high brightness V > 210, low saturation S < 35).
-        # Pink stroma (eosin stain: high saturation S > 50) is strictly rejected!
+        enclosed_holes = binary_fill_holes(closed_fg > 0) & (map_h == 0)
         if original_rgb is not None and np.any(enclosed_holes):
             orig_hsv = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2HSV)
-            sat = orig_hsv[:, :, 1]
-            val = orig_hsv[:, :, 2]
-            is_optical_white = (val > 210) & (sat < 35)
-            valid_lumen = enclosed_holes & is_optical_white
-        else:
-            valid_lumen = enclosed_holes
-
-        interior = (interior | valid_lumen.astype(np.uint8))
+            is_optical_white = (orig_hsv[:, :, 2] > 210) & (orig_hsv[:, :, 1] < 35)
+            enclosed_holes = enclosed_holes & is_optical_white
+        interior = (interior | enclosed_holes.astype(np.uint8))
 
     num_labels, labels = cv2.connectedComponents(interior)
-
     if num_labels <= 1:
-        return np.zeros_like(pred_class, dtype=np.int32)
+        return np.zeros_like(map_h, dtype=np.int32)
 
     unique_ids, counts = np.unique(labels, return_counts=True)
     inst_mask = np.zeros_like(labels, dtype=np.int32)
@@ -500,30 +504,18 @@ def class4_to_instances(
             inst_mask[labels == uid] = next_id
             next_id += 1
 
-    if not expand_boundary or next_id == 1:
+    if next_id == 1:
         return inst_mask
 
-    boundary = (pred_class == 2)
-    if not np.any(boundary):
-        return inst_mask
+    # Step 5: Assign touching-region pixels (class 2) to their closest cell
+    touching = (map_h == 2)
+    if np.any(touching):
+        has_labels = (inst_mask > 0)
+        if np.any(has_labels):
+            _, (nearest_y, nearest_x) = distance_transform_edt(~has_labels, return_indices=True)
+            inst_mask[touching] = inst_mask[nearest_y[touching], nearest_x[touching]]
 
-    has_labels = (inst_mask > 0)
-    if not np.any(has_labels):
-        return inst_mask
-
-    _, (nearest_y, nearest_x) = distance_transform_edt(~has_labels, return_indices=True)
-    if max_boundary_dist is not None:
-        dist = np.sqrt(
-            (np.arange(pred_class.shape[0])[:, None] - nearest_y) ** 2
-            + (np.arange(pred_class.shape[1])[None, :] - nearest_x) ** 2
-        )
-        valid_expand = boundary & (dist <= max_boundary_dist)
-    else:
-        valid_expand = boundary
-
-    inst_mask[valid_expand] = inst_mask[nearest_y[valid_expand], nearest_x[valid_expand]]
-
-    # Final per-instance lumen seal (only for individual instances, never merging across instances)
+    # Step 6: Final instance mask (with gland lumen sealing if applicable)
     if is_gland and fill_lumen:
         for inst_id in range(1, next_id):
             curr_inst = (inst_mask == inst_id)
@@ -536,6 +528,10 @@ def class4_to_instances(
                 inst_mask[single_holes] = inst_id
 
     return inst_mask
+
+
+# Direct drop-in alias for class4_to_instances
+class4_to_instances = j4_reconstruct_instances
 
 
 # Backward compatibility alias
@@ -771,11 +767,11 @@ def assign_instance_classes_by_majority_vote(
 
 def colorize_4class_map(class4_map: np.ndarray) -> np.ndarray:
     """
-    Convert a 4-class semantic map (0: background, 1: interior core, 2: boundary ring, 3: bottom-hat gap)
+    Convert a 4-class semantic map (0: background, 1: cell interior, 2: touching region, 3: bottom-hat gap)
     into a vivid, publication-ready RGB visualization:
       0: Background -> Black       [0, 0, 0]
-      1: Interior   -> Light Green [46, 204, 113]
-      2: Boundary   -> Amber Gold  [241, 196, 15]
+      1: Cell       -> Light Green [46, 204, 113]
+      2: Touching   -> Royal Blue  [41, 128, 185]
       3: Gap        -> Crimson Red [231, 76, 60]
     """
     c4 = np.asarray(class4_map)
@@ -786,8 +782,8 @@ def colorize_4class_map(class4_map: np.ndarray) -> np.ndarray:
 
     palette = [
         [0, 0, 0],         # 0: BG (Black)
-        [46, 204, 113],    # 1: Interior (Emerald Green)
-        [241, 196, 15],    # 2: Boundary (Sun Gold)
+        [46, 204, 113],    # 1: Cell Interior (Emerald Green)
+        [41, 128, 185],    # 2: Touching Region (Royal Blue)
         [231, 76, 60],     # 3: Gap (Crimson Red)
     ]
     for c_idx, color in enumerate(palette):

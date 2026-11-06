@@ -30,23 +30,41 @@ import torch.nn.functional as F
 
 class SoftYoudenJLoss(nn.Module):
     """
-    Computes differentiable Soft Youden's J Loss:
-        L_J = (1 / C) * sum_{c=1}^C [(1 - Sensitivity_c) + (1 - Specificity_c)]
-            = (1 / C) * sum_{c=1}^C [1 - J_c]
+    Computes differentiable Pairwise Soft Youden's J Loss:
+      Reference:
+        Guerrero-Pena et al., "J Regularization Improves Imbalanced Multiclass Segmentation"
+        IEEE International Symposium on Biomedical Imaging (ISBI), 2020. arXiv:1910.09783.
 
-    When predictions are perfect, Sens_c = 1, Spec_c = 1 -> J_c = 1 -> L_J = 0.
-    When predictions are completely inverted, Sens_c = 0, Spec_c = 0 -> J_c = -1 -> L_J = 2.
+    Formulation:
+      For each ordered pair of classes (i, k) where i is the positive class and k is the negative class:
+        alpha_i = sum_p z_i(p) * y_i(p) / n_i            (soft True Positive Rate, TPR)
+        beta_{i, k} = sum_p (1 - z_i(p)) * y_k(p) / n_k  (soft True Negative Rate, TNR)
+        J_{i, k} = alpha_i + beta_{i, k} - 1
+
+      The normalized pairwise score is:
+        (1 + J_{i, k}) / 2 = (alpha_i + beta_{i, k}) / 2 = 1/2 + 1/2 * (TPR_i - FPR_{i, k})
+
+      The multiclass loss is the negative log of pairwise scores over all distinct pairs (i != k):
+        L_J = - (1 / N_pairs) * sum_{i != k} log( (alpha_i + beta_{i, k}) / 2 )
+
+      When predictions are perfect, TPR = 1, TNR = 1 -> score = 1.0 -> L_J = -log(1) = 0.
+      When predictions are random (uniform), score = 0.5 -> L_J = -log(0.5) = log(2) ~= 0.6931.
     """
     def __init__(
         self,
         num_classes: int = 4,
         epsilon: float = 1e-6,
         include_background: bool = True,
+        pairwise_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.epsilon = epsilon
         self.include_background = include_background
+        if pairwise_weights is not None:
+            self.register_buffer("pairwise_weights", pairwise_weights)
+        else:
+            self.pairwise_weights = None
 
     def forward(
         self,
@@ -61,7 +79,7 @@ class SoftYoudenJLoss(nn.Module):
             mask: Optional spatial validity mask [B, H, W] (1 for valid pixels, 0 to ignore)
 
         Returns:
-            Scalar tensor representing the Soft Youden's J Loss.
+            Scalar tensor representing the Pairwise Soft Youden's J Loss.
         """
         b, c, h, w = logits.shape
         probs = F.softmax(logits, dim=1)  # [B, C, H, W]
@@ -85,23 +103,46 @@ class SoftYoudenJLoss(nn.Module):
         probs_flat = probs.view(b, c, -1)
         one_hot_flat = one_hot.view(b, c, -1)
 
-        # TP, FP, TN, FN across batch and spatial dimensions per class
-        tp = torch.sum(probs_flat * one_hot_flat, dim=(0, 2))  # [C]
-        p_total = torch.sum(one_hot_flat, dim=(0, 2))          # [C]
-        fp = torch.sum(probs_flat * (1.0 - one_hot_flat), dim=(0, 2))  # [C]
-        n_total = torch.sum(1.0 - one_hot_flat, dim=(0, 2))   # [C]
-        tn = n_total - fp
+        # Cross-class soft overlap matrix T [C, C]:
+        # T[i, k] = sum_{b, p} probs[b, i, p] * one_hot[b, k, p]
+        # (Total predicted probability of class i on true pixels of class k)
+        T = torch.einsum("bcn,bkn->ck", probs_flat, one_hot_flat)  # [C, C]
+        n = torch.sum(one_hot_flat, dim=(0, 2))                   # [C] pixel counts per class
 
-        # Sensitivity (TPR) and Specificity (TNR)
-        sensitivity = (tp + self.epsilon) / (p_total + self.epsilon)
-        specificity = (tn + self.epsilon) / (n_total + self.epsilon)
+        # Soft TPR alpha_i [C, 1] for positive class i
+        alpha = ((torch.diagonal(T) + self.epsilon) / (n + self.epsilon)).unsqueeze(1)  # [C, 1]
 
-        # Loss per class = 1 - J = (1 - Sens) + (1 - Spec)
-        j_loss_per_class = (1.0 - sensitivity) + (1.0 - specificity)
+        # Soft TNR beta_{i, k} [C, C] for negative class k against class i:
+        # beta_{i, k} = (n_k - T_{i, k} + eps) / (n_k + eps) = 1.0 - T_{i, k} / (n_k + eps)
+        n_col = n.unsqueeze(0)  # [1, C]
+        beta = 1.0 - (T / (n_col + self.epsilon))  # [C, C]
 
-        start_idx = 0 if self.include_background else 1
-        loss = torch.mean(j_loss_per_class[start_idx:])
-        return loss
+        # Pairwise normalized J score: (1 + J_{i, k}) / 2 = (alpha_i + beta_{i, k}) / 2
+        pairwise_score = 0.5 * (alpha + beta)  # [C, C]
+        pairwise_score = torch.clamp(pairwise_score, min=self.epsilon, max=1.0)
+
+        # Pairwise binary surrogate loss: -log( (alpha_i + beta_{i, k}) / 2 )
+        pairwise_loss = -torch.log(pairwise_score)  # [C, C]
+
+        # Identify valid non-diagonal pairs (i != k) where both classes are present in ground truth
+        valid_pairs = (n.unsqueeze(1) > 0) & (n.unsqueeze(0) > 0)
+        valid_pairs.fill_diagonal_(False)
+
+        if not self.include_background and c > 1:
+            valid_pairs[0, :] = False
+            valid_pairs[:, 0] = False
+
+        if self.pairwise_weights is not None:
+            pairwise_loss = pairwise_loss * self.pairwise_weights
+            if valid_pairs.any():
+                w_sum = self.pairwise_weights[valid_pairs].sum().clamp(min=self.epsilon)
+                return pairwise_loss[valid_pairs].sum() / w_sum
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        if valid_pairs.any():
+            return pairwise_loss[valid_pairs].mean()
+
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
 
 class MultiClassDiceLoss(nn.Module):
@@ -200,42 +241,11 @@ class JRegularizedMultiClassLoss(nn.Module):
             ce_raw = F.cross_entropy(logits, targets, reduction='none')
             ce_loss = (ce_raw * mask).sum() / (mask.sum() + 1e-6)
 
-        # 2. Precompute Softmax and One-Hot ONCE in pure FP32
-        b, c, h, w = logits.shape
-        probs = F.softmax(logits, dim=1)
-        if targets.ndim == 3:
-            one_hot = F.one_hot(targets.clamp(0, c - 1), num_classes=c).permute(0, 3, 1, 2).float()
-        else:
-            one_hot = targets.float()
+        # 2. Pairwise Soft Youden's J Loss
+        j_loss = self.j_loss_fn(logits, targets, mask=mask)
 
-        if mask is not None:
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
-            probs = probs * mask
-            one_hot = one_hot * mask
-
-        # Flatten spatial dimensions: [B, C, N] where N = H * W
-        probs_flat = probs.view(b, c, -1)
-        one_hot_flat = one_hot.view(b, c, -1)
-
-        # 3. Soft Youden's J Loss
-        tp = torch.sum(probs_flat * one_hot_flat, dim=(0, 2))
-        p_total = torch.sum(one_hot_flat, dim=(0, 2))
-        fp = torch.sum(probs_flat * (1.0 - one_hot_flat), dim=(0, 2))
-        n_total = torch.sum(1.0 - one_hot_flat, dim=(0, 2))
-        tn = n_total - fp
-
-        eps = self.j_loss_fn.epsilon
-        sensitivity = (tp + eps) / (p_total + eps)
-        specificity = (tn + eps) / (n_total + eps)
-        j_loss_per_class = (1.0 - sensitivity) + (1.0 - specificity)
-        start_idx = 0 if self.j_loss_fn.include_background else 1
-        j_loss = torch.mean(j_loss_per_class[start_idx:])
-
-        # 4. Multi-Class Dice Loss (reuse tp and p_total!)
-        cardinality = p_total + torch.sum(probs_flat, dim=(0, 2))
-        dice = (2.0 * tp + self.dice_loss_fn.epsilon) / (cardinality + self.dice_loss_fn.epsilon)
-        dice_loss = torch.mean((1.0 - dice)[start_idx:])
+        # 3. Multi-Class Dice Loss
+        dice_loss = self.dice_loss_fn(logits, targets, mask=mask)
 
         total_loss = (
             self.ce_weight * ce_loss

@@ -44,6 +44,8 @@ def patchify_monusac_dataset(
     normalize_hv: bool = True,
     save_previews: bool = True,
     preview_dir: Optional[Path] = None,
+    touching_radius: int = 1,
+    gap_kernel_size: int = 5,
 ) -> None:
     dirs = {
         "images": output_dir / "images",
@@ -95,7 +97,15 @@ def patchify_monusac_dataset(
             unified_mask = merge_to_unified_instance_mask(mask_4ch)
             sdf = compute_instance_sdf(unified_mask)
             target_3class = compute_3class_target(unified_mask) if save_3class else None
-            target_4class = compute_4class_target_with_bottom_hat(unified_mask) if save_4class else None
+            target_4class = (
+                compute_4class_target_with_bottom_hat(
+                    unified_mask,
+                    kernel_size=gap_kernel_size,
+                    touching_radius=touching_radius,
+                )
+                if save_4class
+                else None
+            )
 
             # Optional HV flow map calculation
             hv_map = None
@@ -271,6 +281,18 @@ def main():
         help="Directory to save whole-size PNG previews (defaults to data/monusac_full_previews).",
     )
     parser.add_argument(
+        "--touching_radius",
+        type=int,
+        default=1,
+        help="Radius for expanding touching boundary seams within cell bodies (default: 1).",
+    )
+    parser.add_argument(
+        "--gap_kernel_size",
+        type=int,
+        default=5,
+        help="Structuring element diameter for bottom-hat transform (default: 5).",
+    )
+    parser.add_argument(
         "--compute_stats_only",
         action="store_true",
         help="Only compute and save patch_class_stats.json for existing patch directory without regenerating patches.",
@@ -292,6 +314,8 @@ def main():
             normalize_hv=args.normalize_hv,
             save_previews=args.save_previews,
             preview_dir=args.preview_dir,
+            touching_radius=args.touching_radius,
+            gap_kernel_size=args.gap_kernel_size,
         )
 
 

@@ -35,6 +35,8 @@ def patchify_glas_dataset(
     data_dir: Path,
     output_dir: Path,
     patch_size: int = 256,
+    touching_radius: int = 4,
+    gap_kernel_size: int = 15,
     save_hv: bool = True,
     save_3class: bool = True,
     save_4class: bool = True,
@@ -66,7 +68,7 @@ def patchify_glas_dataset(
 
     image_files = sorted([
         f for f in data_dir.glob("train_*.npy")
-        if "_anno" not in f.stem
+        if "_anno" not in f.stem and "_binary" not in f.stem
     ])
     print(f"Found {len(image_files)} full images in {data_dir}")
     print(f"Patch size: {patch_size}x{patch_size}")
@@ -92,7 +94,11 @@ def patchify_glas_dataset(
         # 2. Compute full-size SDF, 3-class target, 4-class target, and HV flow
         sdf = compute_instance_sdf(instance_mask)
         target_3class = compute_3class_target(instance_mask) if save_3class else None
-        target_4class = compute_4class_target_with_bottom_hat(instance_mask) if save_4class else None
+        target_4class = compute_4class_target_with_bottom_hat(
+            instance_mask,
+            kernel_size=gap_kernel_size,
+            touching_radius=touching_radius,
+        ) if save_4class else None
 
         # Optional HV flow map calculation
         hv_map = None
@@ -173,6 +179,18 @@ def main():
         help="Dynamic patch size (default: 256).",
     )
     parser.add_argument(
+        "--touching_radius",
+        type=int,
+        default=4,
+        help="Pixel radius to expand touching gland boundary interface (default: 4).",
+    )
+    parser.add_argument(
+        "--gap_kernel_size",
+        type=int,
+        default=15,
+        help="Diameter of Bottom-Hat morphological kernel in pixels to capture wider inter-gland stromal gap clefts (default: 15).",
+    )
+    parser.add_argument(
         "--output_dir",
         type=Path,
         default=None,
@@ -221,6 +239,8 @@ def main():
         args.data_dir,
         out_dir,
         args.patch_size,
+        touching_radius=args.touching_radius,
+        gap_kernel_size=args.gap_kernel_size,
         save_hv=args.save_hv,
         save_3class=args.save_3class,
         save_4class=args.save_4class,

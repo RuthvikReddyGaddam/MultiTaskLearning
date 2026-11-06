@@ -6,6 +6,7 @@ import time
 from typing import Dict, Any, Optional
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from metrics.monusac_training_metrics import compute_dice_iou_binary, compute_multiclass_metrics
 
@@ -43,9 +44,10 @@ class MultiTaskTrainer:
         self.config = config
         self.scheduler = scheduler
 
-        # Training epochs
+        # Training epochs & gradient accumulation
         training_cfg = config.get("training", {})
         self.epochs = int(training_cfg.get("epochs", config.get("epochs", 50)))
+        self.grad_accum_steps = max(1, int(training_cfg.get("gradient_accumulation_steps", 1)))
 
         # Experiment output directory
         if exp_dir is not None:
@@ -126,7 +128,7 @@ class MultiTaskTrainer:
                 row[k] = f"{v:.4f}" if isinstance(v, float) else v
             writer.writerow(row)
 
-    def train_one_epoch(self) -> Dict[str, float]:
+    def train_one_epoch(self, epoch: int = 1) -> Dict[str, float]:
         """Runs one full training epoch across the multi-task balanced dataloader."""
         self.model.train()
 
@@ -146,7 +148,18 @@ class MultiTaskTrainer:
         monusac_cls_dice_sum, monusac_cls_iou_sum = 0.0, 0.0
         glas_neg_bg_sum, n_glas_neg = 0.0, 0
 
-        for batch in self.train_loader:
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"[Epoch {epoch:03d}/{self.epochs:03d}]",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+        )
+
+        num_batches = len(self.train_loader)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(pbar):
             # Transfer strictly required tensors with non_blocking=True
             images = batch["image"].to(self.device, non_blocking=True)
             task_ids = batch["task_id"].to(self.device, non_blocking=True)
@@ -168,113 +181,128 @@ class MultiTaskTrainer:
             if "class_mask" in batch and batch["class_mask"] is not None:
                 batch_gpu["class_mask"] = batch["class_mask"].to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad(set_to_none=True)
-
             # Pure FP32 forward pass with sliced multi-task prediction head
             preds = self.model(images, task_ids=task_ids)
 
             # Compute decoupled multi-task loss
             loss, batch_logs = self.criterion(preds, batch_gpu)
 
-            loss.backward()
-            self.optimizer.step()
+            # Skip backward and optimizer step if loss is NaN or Inf to protect model weights
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[Warning] Batch {batch_idx + 1} produced {loss.item()} loss. Skipping batch update.")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
 
-            total_loss += float(loss.detach())
+            loss_scaled = loss / self.grad_accum_steps
+            loss_scaled.backward()
+
+            if (batch_idx + 1) % self.grad_accum_steps == 0 or (batch_idx + 1) == num_batches:
+                # Gradient clipping to prevent gradient explosion and NaN weights
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+            cur_loss = float(loss.detach())
+            total_loss += cur_loss
             for k, v in batch_logs.items():
                 loss_components_accum[k] = loss_components_accum.get(k, 0.0) + float(v.detach() if isinstance(v, torch.Tensor) else v)
 
+            # Update progress bar metrics
+            avg_loss = total_loss / (batch_idx + 1)
+            lr = self.optimizer.param_groups[0]["lr"]
+            pbar.set_postfix({"loss": f"{cur_loss:.3f}", "avg": f"{avg_loss:.3f}", "lr": f"{lr:.1e}"})
+
+            # Explicitly free batch computation tensors
+            del loss, loss_scaled
+
             # Compute batch evaluation metrics
             with torch.no_grad():
-                B = images.shape[0]
-                half = B // 2
-                q3 = half + B // 4
-                if B % 8 == 0 and (task_ids[:half] == 0).all() and (task_ids[half:q3] == 1).all() and (task_ids[q3:] == 2).all():
-                    # 1. GLaS (slice 0 : half)
-                    p_argmax = preds["gland_seg"].argmax(dim=1)
-                    p_bin_g = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1)
-                    d_g, i_g = compute_dice_iou_binary(p_bin_g, binary_masks[:half])
-                    glas_dice_sum += d_g * half
-                    glas_iou_sum += i_g * half
-                    n_glas += half
+                is_gland = (task_ids == 0)
+                is_monuseg = (task_ids == 1)
+                is_monusac = (task_ids == 2)
+                is_cell = is_monuseg | is_monusac
 
-                    # 2. MoNuSeg (slice half : q3)
-                    p_argmax_m = preds["cell_seg"][: B // 4].argmax(dim=1)
-                    p_bin_m = ((p_argmax_m == 1) | (p_argmax_m == 2)).float().unsqueeze(1)
-                    d_m, i_m = compute_dice_iou_binary(p_bin_m, binary_masks[half:q3])
-                    monuseg_dice_sum += d_m * (B // 4)
-                    monuseg_iou_sum += i_m * (B // 4)
-                    n_monuseg += (B // 4)
+                # 1. GLaS (slice or mask)
+                k_g = int(is_gland.sum().item())
+                p_gland = preds.get("gland_seg", preds.get("glas_seg"))
+                if k_g > 0 and p_gland is not None:
+                    if p_gland.shape[0] == images.shape[0]:
+                        p_gland = p_gland[is_gland]
+                    p_argmax = p_gland.argmax(dim=1) if p_gland.shape[1] > 1 else (torch.sigmoid(p_gland) > 0.5).long().squeeze(1)
+                    p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_gland.shape[1] > 1 else p_argmax.float().unsqueeze(1)
+                    gt_glas = binary_masks[is_gland]
+                    d, i = compute_dice_iou_binary(p_bin, gt_glas)
+                    glas_dice_sum += d * k_g
+                    glas_iou_sum += i * k_g
+                    n_glas += k_g
 
-                    # 3. MoNuSAC Seg (slice q3 : B)
-                    p_argmax_s = preds["cell_seg"][B // 4 :].argmax(dim=1)
-                    p_bin_s = ((p_argmax_s == 1) | (p_argmax_s == 2)).float().unsqueeze(1)
-                    d_s, i_s = compute_dice_iou_binary(p_bin_s, binary_masks[q3:])
-                    monusac_dice_sum += d_s * (B // 4)
-                    monusac_iou_sum += i_s * (B // 4)
-                    n_monusac += (B // 4)
+                # 2. MoNuSeg
+                k_m = int(is_monuseg.sum().item())
+                p_cell_monuseg = preds.get("monuseg_seg")
+                if p_cell_monuseg is not None and p_cell_monuseg.shape[0] == images.shape[0]:
+                    p_cell_monuseg = p_cell_monuseg[is_monuseg]
+                elif p_cell_monuseg is None and "cell_seg" in preds:
+                    p_c = preds["cell_seg"]
+                    if p_c.shape[0] == images.shape[0]:
+                        p_cell_monuseg = p_c[is_monuseg]
+                    elif is_cell.any() and p_c.shape[0] == is_cell.sum().item():
+                        p_cell_monuseg = p_c[task_ids[is_cell] == 1]
+                    else:
+                        p_cell_monuseg = p_c
 
-                    # 4. MoNuSAC Phenotype Classification (slice q3 : B)
-                    cls_metrics = compute_multiclass_metrics(preds["cell_class"], class_maps[q3:])
-                    monusac_cls_dice_sum += cls_metrics["cell_dice"] * (B // 4)
-                    monusac_cls_iou_sum += cls_metrics["cell_iou"] * (B // 4)
+                if k_m > 0 and p_cell_monuseg is not None:
+                    p_argmax = p_cell_monuseg.argmax(dim=1) if p_cell_monuseg.shape[1] > 1 else (torch.sigmoid(p_cell_monuseg) > 0.5).long().squeeze(1)
+                    p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_cell_monuseg.shape[1] > 1 else p_argmax.float().unsqueeze(1)
+                    gt_monuseg = binary_masks[is_monuseg]
+                    d, i = compute_dice_iou_binary(p_bin, gt_monuseg)
+                    monuseg_dice_sum += d * k_m
+                    monuseg_iou_sum += i * k_m
+                    n_monuseg += k_m
 
-                    # 5. Negative supervision suppression tracking
-                    if "gland_neg" in preds:
-                        neg_pred_bg = (preds["gland_neg"].argmax(dim=1) == 0).float().mean()
-                        k_neg = preds["gland_neg"].shape[0]
-                        glas_neg_bg_sum += float(neg_pred_bg.item()) * k_neg
-                        n_glas_neg += k_neg
-                else:
-                    # Dynamic fallback for non-standard batches
-                    is_gland = batch_gpu.get("is_gland", task_ids == 0)
-                    p_gland = preds.get("gland_seg", preds.get("glas_seg"))
-                    if is_gland.any() and p_gland is not None:
-                        p_argmax = p_gland.argmax(dim=1) if p_gland.shape[1] > 1 else (torch.sigmoid(p_gland) > 0.5).long().squeeze(1)
-                        p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_gland.shape[1] > 1 else p_argmax.float().unsqueeze(1)
-                        gt_glas = binary_masks[is_gland]
-                        k_g = int(is_gland.sum().item())
-                        d, i = compute_dice_iou_binary(p_bin, gt_glas)
-                        glas_dice_sum += d * k_g
-                        glas_iou_sum += i * k_g
-                        n_glas += k_g
+                # 3. MoNuSAC (seg & classification)
+                k_s = int(is_monusac.sum().item())
+                p_cell_monusac = preds.get("monusac_seg")
+                if p_cell_monusac is not None and p_cell_monusac.shape[0] == images.shape[0]:
+                    p_cell_monusac = p_cell_monusac[is_monusac]
+                elif p_cell_monusac is None and "cell_seg" in preds:
+                    p_c = preds["cell_seg"]
+                    if p_c.shape[0] == images.shape[0]:
+                        p_cell_monusac = p_c[is_monusac]
+                    elif is_cell.any() and p_c.shape[0] == is_cell.sum().item():
+                        p_cell_monusac = p_c[task_ids[is_cell] == 2]
+                    else:
+                        p_cell_monusac = p_c
 
-                    is_monuseg = batch_gpu.get("is_monuseg", task_ids == 1)
-                    p_cell_monuseg = preds.get("monuseg_seg", preds.get("cell_seg"))
-                    if is_monuseg.any() and p_cell_monuseg is not None:
-                        p_argmax = p_cell_monuseg.argmax(dim=1) if p_cell_monuseg.shape[1] > 1 else (torch.sigmoid(p_cell_monuseg) > 0.5).long().squeeze(1)
-                        p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_cell_monuseg.shape[1] > 1 else p_argmax.float().unsqueeze(1)
-                        gt_monuseg = binary_masks[is_monuseg]
-                        k_m = int(is_monuseg.sum().item())
-                        d, i = compute_dice_iou_binary(p_bin, gt_monuseg)
-                        monuseg_dice_sum += d * k_m
-                        monuseg_iou_sum += i * k_m
-                        n_monuseg += k_m
+                if k_s > 0:
+                    if p_cell_monusac is not None:
+                        p_argmax = p_cell_monusac.argmax(dim=1) if p_cell_monusac.shape[1] > 1 else (torch.sigmoid(p_cell_monusac) > 0.5).long().squeeze(1)
+                        p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_cell_monusac.shape[1] > 1 else p_argmax.float().unsqueeze(1)
+                        gt_sac = binary_masks[is_monusac]
+                        d, i = compute_dice_iou_binary(p_bin, gt_sac)
+                        monusac_dice_sum += d * k_s
+                        monusac_iou_sum += i * k_s
+                        n_monusac += k_s
 
-                    is_monusac = batch_gpu.get("is_monusac", task_ids == 2)
-                    p_cell_monusac = preds.get("monusac_seg", preds.get("cell_seg"))
-                    if is_monusac.any():
-                        k_s = int(is_monusac.sum().item())
-                        if p_cell_monusac is not None:
-                            p_argmax = p_cell_monusac.argmax(dim=1) if p_cell_monusac.shape[1] > 1 else (torch.sigmoid(p_cell_monusac) > 0.5).long().squeeze(1)
-                            p_bin = ((p_argmax == 1) | (p_argmax == 2)).float().unsqueeze(1) if p_cell_monusac.shape[1] > 1 else p_argmax.float().unsqueeze(1)
-                            gt_sac = binary_masks[is_monusac]
-                            d, i = compute_dice_iou_binary(p_bin, gt_sac)
-                            monusac_dice_sum += d * k_s
-                            monusac_iou_sum += i * k_s
-                            n_monusac += k_s
+                    p_cls = preds.get("cell_class", preds.get("monusac_class"))
+                    if p_cls is not None:
+                        if p_cls.shape[0] == images.shape[0]:
+                            p_cls = p_cls[is_monusac]
+                        gt_cls = class_maps[is_monusac]
+                        cls_metrics = compute_multiclass_metrics(p_cls, gt_cls)
+                        monusac_cls_dice_sum += cls_metrics["cell_dice"] * k_s
+                        monusac_cls_iou_sum += cls_metrics["cell_iou"] * k_s
 
-                        p_cls = preds.get("cell_class", preds.get("monusac_class"))
-                        if p_cls is not None:
-                            gt_cls = class_maps[is_monusac]
-                            cls_metrics = compute_multiclass_metrics(p_cls, gt_cls)
-                            monusac_cls_dice_sum += cls_metrics["cell_dice"] * k_s
-                            monusac_cls_iou_sum += cls_metrics["cell_iou"] * k_s
+                # 4. Negative supervision suppression tracking
+                if "gland_neg" in preds:
+                    neg_pred_bg = (preds["gland_neg"].argmax(dim=1) == 0).float().mean()
+                    k_neg = preds["gland_neg"].shape[0]
+                    glas_neg_bg_sum += float(neg_pred_bg.item()) * k_neg
+                    n_glas_neg += k_neg
 
-                    if "gland_neg" in preds:
-                        neg_pred_bg = (preds["gland_neg"].argmax(dim=1) == 0).float().mean()
-                        k_neg = preds["gland_neg"].shape[0]
-                        glas_neg_bg_sum += float(neg_pred_bg.item()) * k_neg
-                        n_glas_neg += k_neg
+            # Explicitly free batch dictionaries to avoid caching allocator fragmentation
+            del preds, batch_gpu
+            if self.device.type == "cuda" and (batch_idx + 1) % 50 == 0:
+                torch.cuda.empty_cache()
 
         total_cell_n = n_monuseg + n_monusac
         overall_cell_dice = (monuseg_dice_sum + monusac_dice_sum) / max(1, total_cell_n)
@@ -301,19 +329,66 @@ class MultiTaskTrainer:
 
         return metrics
 
+    def _print_dataloader_stats(self) -> None:
+        """Reports detailed patch pool, batch composition, and per-epoch throughput."""
+        dataset = getattr(self.train_loader, "dataset", None)
+        num_batches = len(self.train_loader)
+        batch_size = int(self.config.get("training", {}).get("batch_size", 8))
+        total_patches_epoch = num_batches * batch_size
+        k_glas = batch_size // 2
+        k_monuseg = batch_size // 4
+        k_monusac = batch_size // 4
+
+        print("\n" + "=" * 80)
+        print("           [MultiTaskTrainer] DataLoader & Dataset Statistics")
+        print("=" * 80)
+        if dataset is not None:
+            n_glas = len(getattr(dataset, "glas_dataset", []))
+            n_monuseg = len(getattr(dataset, "monuseg_dataset", []))
+            sac_ds = getattr(dataset, "monusac_dataset", [])
+            n_monusac = len(sac_ds)
+            if hasattr(sac_ds, "patches_per_class"):
+                sac_desc = f"{n_monusac:>6d} pseudo-patches ({sac_ds.patches_per_class}/class: 80 Epi, 80 Lym, 80 Neu, 80 Mac - 1:1:1:1)"
+            else:
+                sac_desc = f"{n_monusac:>6d} patches"
+            print("Dataset Patch Pool:")
+            print(f"  - GLaS (Glands):         {n_glas:>6d} patches")
+            print(f"  - MoNuSeg (Nuclei):      {n_monuseg:>6d} patches")
+            print(f"  - MoNuSAC (Phenotypes):  {sac_desc}")
+            print(f"  - Combined Unique Pool:  {n_glas + n_monuseg + n_monusac:>6d} patches")
+            print("-" * 80)
+
+        print("Per-Batch Composition (2:1:1 Ratio, Randomly Shuffled):")
+        print(f"  - Batch Size:            {batch_size:>6d} patches/batch")
+        print(f"    * GLaS (task 0):       {k_glas:>6d} patches ({k_glas/batch_size*100:.0f}%)")
+        print(f"    * MoNuSeg (task 1):    {k_monuseg:>6d} patches ({k_monuseg/batch_size*100:.0f}%)")
+        print(f"    * MoNuSAC (task 2):    {k_monusac:>6d} patches ({k_monuseg/batch_size*100:.0f}%)")
+        print("-" * 80)
+        print("Per-Epoch Sampling Statistics:")
+        print(f"  - Total Batches / Epoch: {num_batches:>6d} batches")
+        print(f"  - Total Patches / Epoch: {total_patches_epoch:>6d} patches")
+        print(f"    * GLaS Sampled:        {num_batches * k_glas:>6d} patches/epoch")
+        print(f"    * MoNuSeg Sampled:     {num_batches * k_monuseg:>6d} patches/epoch")
+        print(f"    * MoNuSAC Sampled:     {num_batches * k_monusac:>6d} patches/epoch")
+        print("=" * 80 + "\n")
+
     def fit(self) -> None:
         """Runs the multi-task training loop across all epochs."""
         if self.start_epoch > self.epochs:
             print(f"[MultiTaskTrainer] Training already completed ({self.start_epoch - 1}/{self.epochs} epochs).")
             return
 
-        print(f"\n[MultiTaskTrainer] Starting multi-task training: epochs {self.start_epoch} to {self.epochs}")
-        print(f"Batch composition: strict 1:1:1 equal task sampling per batch.")
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+
+        self._print_dataloader_stats()
+
+        print(f"[MultiTaskTrainer] Starting multi-task training: epochs {self.start_epoch} to {self.epochs}")
         print("-" * 80)
 
         for epoch in range(self.start_epoch, self.epochs + 1):
             t0 = time.time()
-            metrics = self.train_one_epoch()
+            metrics = self.train_one_epoch(epoch=epoch)
 
             if self.scheduler is not None:
                 self.scheduler.step()

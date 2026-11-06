@@ -25,13 +25,14 @@ Dedicated, streamlined multi-task deep learning framework across three benchmark
 
 ## 2. Invariants & Data Contracts
 
-### A. Batch Composition & In-Batch Shuffling
-- **Batch Size Constraint**: Must be a multiple of 8 (default: `8`).
+### A. Batch Composition, Gradient Accumulation & In-Batch Shuffling
+- **Batch Size Constraint**: Must be a multiple of 4 (e.g., `4`, `8`, `16`, `24`).
+  - Standard training uses `batch_size: 8`.
+  - For memory-constrained environments or large patch sizes, `batch_size: 4` with `gradient_accumulation_steps: 2` preserves the exact effective batch size of 8.
 - **Exact 2:1:1 Task Allocation**:
-  - 4 GLaS patches (`task_id = 0`)
-  - 2 MoNuSeg patches (`task_id = 1`)
-  - 2 MoNuSAC patches (`task_id = 2`)
-- **Randomized Order**: Within each batch of 8, patches are **randomly shuffled** during training via `EqualTaskBatchSampler`.
+  - $B=8$: 4 GLaS patches (`task_id = 0`), 2 MoNuSeg patches (`task_id = 1`), 2 MoNuSAC patches (`task_id = 2`).
+  - $B=4$: 2 GLaS patches (`task_id = 0`), 1 MoNuSeg patch (`task_id = 1`), 1 MoNuSAC patch (`task_id = 2`).
+- **Randomized Order**: Within each batch, patches are **randomly shuffled** during training via `EqualTaskBatchSampler`.
 - **Mask-Based Routing**: **Never assume fixed positional slices** (e.g., `batch[:4]`). Always route using boolean indicator masks:
   ```python
   is_gland   = (task_ids == 0)
@@ -41,11 +42,11 @@ Dedicated, streamlined multi-task deep learning framework across three benchmark
   ```
 
 ### B. Target Schemas
-1. **4-Class Semantic Segmentation Target (`target_4class`)**:
-   - `0`: Background
-   - `1`: Instance Interior (Core)
-   - `2`: Instance Boundary (Contour ring)
-   - `3`: Inter-Instance Gap / Contact Seam (Bottom-Hat morphological transform: $\text{Closing}(M) - M$)
+1. **4-Class J4 Semantic Segmentation Target (`target_4class`)**:
+   - `0`: Background (Outside cells/glands)
+   - `1`: Cell/Gland Interior ($M_{\text{cell}}$, non-touching cell body pixels)
+   - `2`: Touching Region ($\Gamma$, cell pixels directly adjacent/touching a different cell instance in 8-neighborhood)
+   - `3`: Gap (Background pixels in narrow crevices between cells via Bottom-Hat: $\text{Closing}(M) - M$)
 2. **MoNuSAC Cell Phenotype Classification (`class_map`)**:
    - `-1`: Ignored / Non-MoNuSAC patches (GLaS and MoNuSeg)
    - `0`: Background
@@ -54,18 +55,39 @@ Dedicated, streamlined multi-task deep learning framework across three benchmark
    - `3`: Neutrophil
    - `4`: Macrophage
 
-### C. Multi-Task Prediction Head Contract (`MultiTaskPredictionHead`)
-- `preds["gland_seg"]`: Gland predictions evaluated on `x[is_gland]` (4 classes).
-- `preds["gland_neg"]`: Cell patches `x[is_cell]` evaluated through the gland head for **negative background supervision** (target: class 0), actively suppressing false-positive cell detections in glands.
-- `preds["cell_seg"]`: Shared cell segmentation evaluated on `x[is_cell]`.
-- `preds["monuseg_seg"]`: Sliced from cell predictions for MoNuSeg patches (`task_ids[is_cell] == 1`).
-- `preds["monusac_seg"]`: Sliced from cell predictions for MoNuSAC patches (`task_ids[is_cell] == 2`).
-- `preds["cell_class"]`: MoNuSAC phenotype classification evaluated on `x[is_monusac]` (5 classes).
+### C. Multi-Task Prediction Head Contract (`MultiTaskPredictionHead` & `ModelMaskedDecoders`)
+- **Training Mode (`model.train()`) - Task-Sliced Feature Routing**:
+  - `image_features` and `geometric_features` are sliced before being routed to each respective decoder.
+  - `preds["gland_seg"]`: Gland predictions evaluated ONLY on `x[is_gland]` (4 classes).
+  - `preds["cell_seg"]`: Shared cell segmentation evaluated on `x[is_cell]` (4 classes).
+  - `preds["monuseg_seg"]`: Evaluated on MoNuSeg patches (`is_monuseg`).
+  - `preds["monusac_seg"]`: Evaluated on MoNuSAC patches (`is_monusac`).
+  - `preds["cell_class"]`: MoNuSAC phenotype classification evaluated ONLY on `x[is_monusac]` (5 classes).
+  - Cuts intermediate memory consumption by >50% (from 45.6 GB down to ~20.8 GB peak during backward pass).
+- **Inference Mode (`model.eval()`) - Full Dense Prediction**:
+  - When `task_ids` is None or during evaluation (`model.eval()`), all three decoders (`gland_decoder`, `cell_seg_decoder`, `cell_class_decoder`) evaluate densely across all input patches, yielding full-batch predictions of shape `[B, C, H, W]` across all heads simultaneously.
 
-### D. Multi-Task Loss Formulation (`MultiTaskLoss` & `SoftYoudenJLoss`)
-- Integrates differentiable **Soft Youden's J-statistic regularization** ($J = \text{Sensitivity} + \text{Specificity} - 1$) alongside weighted Cross-Entropy and Generalized Dice loss to separate contacting cells and rare gap pixels.
+### D. Multi-Task Loss Formulation (`MultiTaskLoss`)
+- **4-Class Segmentation (GLaS, MoNuSeg, MoNuSAC seg)**: Integrates differentiable **Pairwise Soft Youden's J-statistic regularization** ($J = \text{Sensitivity} + \text{Specificity} - 1$) alongside Cross-Entropy and Generalized Dice loss.
+- **5-Class Phenotype Classification (MoNuSAC cls)**: Supervised over the whole patch using strictly **unweighted Cross-Entropy** (`weight=None`) and Multi-Class Dice loss without J-regularization. Valid pixel existence is strictly guarded (`(sac_cls_gt >= 0).any()`) to return `0.0` gracefully and prevent NaN loss when batches contain non-labeled pixels.
+- Negative supervision is completely removed in favor of clean task gradient isolation via masked decoders.
 - Total multi-task loss formulation:
-  $$\mathcal{L} = w_{\text{glas}} \cdot (\mathcal{L}_{\text{glas}} + \lambda_{\text{neg}} \mathcal{L}_{\text{neg}}) + w_{\text{monuseg}} \cdot \mathcal{L}_{\text{monuseg}} + w_{\text{monusac}} \cdot (\mathcal{L}_{\text{monusac\_seg}} + \mathcal{L}_{\text{monusac\_cls}})$$
+  $$\mathcal{L} = w_{\text{glas}} \cdot \mathcal{L}_{\text{glas}} + w_{\text{monuseg}} \cdot \mathcal{L}_{\text{monuseg}} + w_{\text{monusac}} \cdot (\mathcal{L}_{\text{monusac\_seg}} + \mathcal{L}_{\text{monusac\_cls}})$$
+
+### E. Memory Management & Multi-Decoder Scaling
+- **VRAM Allocation Configuration**: When running training on dense multi-decoder architectures with 512x512 patches, configure PyTorch's caching allocator to prevent heap fragmentation across hundreds of accumulation steps:
+  ```bash
+  export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,expandable_segments:True"
+  ```
+- **Intermediate Activation Lifecycle**: In `trainer_multitask.py`, explicit intermediate tensor deletion (`del preds, batch_gpu, loss, loss_scaled`) and periodic cache clearing (`torch.cuda.empty_cache()` every 50 iterations) ensure stable long-running training within single 48GB Quadro GPUs.
+
+### F. Parameter-Free J4 MAP Instance Reconstruction Pipeline (`j4_reconstruct_instances`)
+1. **Four-Channel Softmax Prediction**: $Z \in \mathbb{R}^{4 \times H \times W}$ for classes $\{0: \text{BG}, 1: \text{Cell}, 2: \text{Touching}, 3: \text{Gap}\}$.
+2. **Maximum A Posteriori (MAP)**: $\hat{h}(p) = \arg\max_{k \in \{0, 1, 2, 3\}} Z_k(p)$.
+3. **Gap Resolution**: Confident gaps remain background ($0$); uncertain gaps ($Z_3 < \tau$) are reassigned to $\arg\max_{k \in \{0, 1, 2\}} Z_k(p)$.
+4. **Connected-Component Labeling**: Applied strictly to cell interiors $M_{\text{cell}} = [\hat{h} == 1]$ to generate distinct integer instance seeds $1..N$.
+5. **Touching Pixel Assignment**: Touching pixels ($\hat{h} == 2$) are assigned the integer ID of their closest labeled cell interior instance via Euclidean distance transform.
+6. **Mask-Guided Phenotype Majority Voting**: Phenotype classification is evaluated on the segmented cell instances ($\hat{g} > 0$), where instance pixels vote among foreground classes $1..4$ to assign a single uniform phenotype per instance, eliminating false positives on stroma.
 
 ### E. Class-Stratified Hierarchical MoNuSAC Resampling
 - **Hierarchical Priority Bucket Assignment**:

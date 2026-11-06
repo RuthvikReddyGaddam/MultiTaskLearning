@@ -11,13 +11,28 @@ from datasets.multitask_dataset import build_multitask_dataloader
 
 
 class TestMultitaskSampler8Batch(unittest.TestCase):
-    def test_sampler_requires_multiple_of_8(self):
+    def test_sampler_requires_multiple_of_4(self):
         lengths = [328, 120, 650]
-        # Legacy batch_size=6 must now fail!
+        # Non-multiples of 4 must fail!
         with self.assertRaises(ValueError):
             EqualTaskBatchSampler(dataset_lengths=lengths, batch_size=6)
         with self.assertRaises(ValueError):
             EqualTaskBatchSampler(dataset_lengths=lengths, batch_size=10)
+
+    def test_sampler_supports_batch_size_4(self):
+        lengths = [328, 120, 650]
+        B = 4
+        sampler = EqualTaskBatchSampler(dataset_lengths=lengths, batch_size=B, shuffle=False, steps_per_epoch=4)
+        self.assertEqual(len(sampler), 4)
+
+        for batch in sampler:
+            self.assertEqual(len(batch), 4)
+            # 0:2 must be GLaS [0, 327] (2 patches)
+            self.assertTrue(all(0 <= idx < 328 for idx in batch[0:2]), f"GLaS slice failed: {batch[0:2]}")
+            # 2:3 must be MoNuSeg [328, 447] (1 patch)
+            self.assertTrue(all(328 <= idx < 448 for idx in batch[2:3]), f"MoNuSeg slice failed: {batch[2:3]}")
+            # 3:4 must be MoNuSAC [448, 1097] (1 patch)
+            self.assertTrue(all(448 <= idx < 1098 for idx in batch[3:4]), f"MoNuSAC slice failed: {batch[3:4]}")
 
     def test_sampler_yields_exact_half_glas_quarter_monuseg_quarter_monusac(self):
         lengths = [328, 120, 650]

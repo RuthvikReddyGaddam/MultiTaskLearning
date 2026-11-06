@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 from PIL import Image
 from scipy.ndimage import distance_transform_edt, find_objects, gaussian_filter
-from skimage.morphology import skeletonize
 
 
 def load_bmp_image(image_path: Path) -> np.ndarray:
@@ -34,11 +33,10 @@ def save_glas_sample(
     target_3class: Optional[np.ndarray] = None,
     target_4class: Optional[np.ndarray] = None,
 ) -> None:
-    """Saves image, instance mask, binary mask, and optional full-size targets in output_dir."""
+    """Saves image and instance mask (integer IDs 1..N) and optional targets in output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(output_dir / f"{base_name}.npy", image)
-    np.save(output_dir / f"{base_name}_anno.npy", mask)
-    np.save(output_dir / f"{base_name}_binary.npy", (mask > 0).astype(np.float32))
+    np.save(output_dir / f"{base_name}_anno.npy", mask.astype(np.int32))
     if sdf is not None:
         np.save(output_dir / f"{base_name}_sdf.npy", sdf)
     if hv_map is not None:
@@ -119,20 +117,19 @@ def compute_instance_sdf(instance_mask: np.ndarray) -> np.ndarray:
 def compute_4class_target_with_bottom_hat(
     instance_mask: np.ndarray,
     kernel_size: int = 5,
-    boundary_width: int = 2,
+    touching_radius: int = 4,
 ) -> np.ndarray:
     """
-    Computes a 4-channel target map using per-instance boundary/interior extraction
-    and Bottom-Hat transform for inter-gland stromal gap isolation:
+    Computes a 4-channel target map using J4 formulation (Guerrero-Pena et al.):
       0: Background
-      1: Interior (Core seed)
-      2: Boundary (Gland contour ring)
+      1: Cell/Gland Interior (Core seed)
+      2: Touching Region (Gland pixels touching another gland instance, expanded by touching_radius)
       3: Gap (Inter-gland stromal clefts/valleys via Bottom-Hat: Closing(M) - M)
 
     Args:
         instance_mask: [H, W] integer instance mask (0 = bg, 1..N = instance IDs).
         kernel_size: Structuring element diameter for bottom-hat transform (default: 5).
-        boundary_width: Width of instance contour boundary in pixels (default: 2).
+        touching_radius: Pixel radius to expand touching contact boundary (default: 4 for glands).
 
     Returns:
         target_4class: [H, W] integer array with values in {0, 1, 2, 3}.
@@ -147,13 +144,38 @@ def compute_4class_target_with_bottom_hat(
     if not np.any(bin_mask):
         return target
 
-    # 1. Bottom-Hat Transform on binary mask: BTH(M) = Closing(M) - M
+    # 1. Bottom-Hat Transform on background: BTH(M) = Closing(M) - M
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     bottom_hat = cv2.morphologyEx(bin_mask, cv2.MORPH_BLACKHAT, kernel)
-    gap_mask = (bottom_hat > 0)
+    raw_gap_mask = (bottom_hat > 0) & (instance_mask == 0)
 
-    # 2. Add touching contact seams between distinct instances to gap_mask
+    # Eliminate intra-gland gaps (ridges, folds, or indentations of the SAME gland):
+    # A gap pixel is only a true INTER-instance gap if it lies between at least TWO DIFFERENT gland instances.
+    gap_mask = np.zeros((h, w), dtype=bool)
+    if np.any(raw_gap_mask):
+        # Find the nearest non-zero instance ID for every background pixel
+        has_instance = (instance_mask > 0)
+        if np.any(has_instance):
+            _, (nearest_y, nearest_x) = distance_transform_edt(~has_instance, return_indices=True)
+            nearest_id_map = instance_mask[nearest_y, nearest_x]
+
+            # In a local neighborhood around each candidate gap pixel, check if >1 distinct instance IDs are present
+            gap_candidates = np.argwhere(raw_gap_mask)
+            rad = max(2, kernel_size // 2)
+            for gy, gx in gap_candidates:
+                y0 = max(0, gy - rad)
+                y1 = min(h, gy + rad + 1)
+                x0 = max(0, gx - rad)
+                x1 = min(w, gx + rad + 1)
+
+                local_ids = nearest_id_map[y0:y1, x0:x1]
+                unique_local_ids = np.unique(local_ids[local_ids > 0])
+                if len(unique_local_ids) >= 2:
+                    gap_mask[gy, gx] = True
+
+    # 2. Identify contact seams between distinct gland instances
     slices = find_objects(instance_mask)
+    seam = np.zeros((h, w), dtype=bool)
     if len(slices) > 1:
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
             y_src = slice(max(0, -dy), min(h, h - dy))
@@ -164,44 +186,37 @@ def compute_4class_target_with_bottom_hat(
             src_vals = instance_mask[y_src, x_src]
             dst_vals = instance_mask[y_dst, x_dst]
 
-            seam = (src_vals > 0) & (dst_vals > 0) & (src_vals != dst_vals)
-            gap_mask[y_src, x_src] |= seam
+            touch = (src_vals > 0) & (dst_vals > 0) & (src_vals != dst_vals)
+            seam[y_src, x_src] |= touch
 
-    # 3. For each instance, compute interior (class 1) and boundary (class 2) per-instance
-    k_erode = np.ones((3, 3), np.uint8) if boundary_width == 1 else cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * boundary_width + 1, 2 * boundary_width + 1))
+    # 3. Expand touching region by touching_radius within the gland foreground
+    if np.any(seam) and touching_radius > 1:
+        k_touch = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * touching_radius + 1, 2 * touching_radius + 1))
+        touching_expanded = cv2.dilate(seam.astype(np.uint8), k_touch)
+        touching_mask = (touching_expanded > 0) & (bin_mask > 0)
+    else:
+        touching_mask = seam
 
-    for inst_id, sl in enumerate(slices, start=1):
-        if sl is None:
-            continue
-        obj_crop = (instance_mask[sl] == inst_id)
-        if not np.any(obj_crop):
-            continue
+    # 4. Cell interior: gland body pixels not in touching region
+    interior_mask = (bin_mask > 0) & (~touching_mask)
 
-        target_sl = target[sl]
+    # Degeneracy check: ensure every instance preserves at least 1 interior pixel
+    if len(slices) > 0:
+        for inst_id, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            inst_crop = (instance_mask[sl] == inst_id)
+            if not np.any(inst_crop):
+                continue
+            if not np.any(interior_mask[sl] & inst_crop):
+                edt = distance_transform_edt(inst_crop)
+                peak_y, peak_x = np.unravel_index(np.argmax(edt), inst_crop.shape)
+                interior_mask[sl][peak_y, peak_x] = True
+                touching_mask[sl][peak_y, peak_x] = False
 
-        if boundary_width > 0:
-            eroded = cv2.erode(obj_crop.astype(np.uint8), k_erode, iterations=1)
-            boundary = obj_crop & (eroded == 0)
-
-            # Degeneracy check: ensure small instances retain at least 1 interior seed pixel
-            if not np.any(eroded):
-                edt = distance_transform_edt(obj_crop)
-                peak_y, peak_x = np.unravel_index(np.argmax(edt), obj_crop.shape)
-                eroded[peak_y, peak_x] = 1
-                boundary[peak_y, peak_x] = False
-
-            target_sl[boundary] = 2
-            target_sl[eroded > 0] = 1
-        else:
-            target_sl[obj_crop] = 1
-
-        target[sl] = target_sl
-
-    # 4. Gaps take priority at contact/valley locations (class 3)
+    target[interior_mask] = 1
+    target[touching_mask] = 2
     target[gap_mask] = 3
-
-    # Ensure background is 0
-    target[(instance_mask == 0) & (~gap_mask)] = 0
 
     return target
 

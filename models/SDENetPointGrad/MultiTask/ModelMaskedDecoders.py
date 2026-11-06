@@ -235,52 +235,80 @@ class ModelMaskedDecoders(nn.Module):
                     "classification": p_cls,
                 }
 
-        # 3. Dense execution: ALL 3 decoders receive ALL features across the full batch
-        feat_gland = self.gland_decoder(image_features, geometric_features)
-        feat_cell_seg = self.cell_seg_decoder(image_features, geometric_features)
-        feat_cell_class = self.cell_class_decoder(image_features, geometric_features)
+        # 3. Dense Inference Mode (when in eval mode or task_ids is None)
+        # All decoders evaluate densely across all B patches without task slicing
+        if not self.training or task_ids is None:
+            feat_gland = self.gland_decoder(image_features, geometric_features)
+            feat_cell_seg = self.cell_seg_decoder(image_features, geometric_features)
+            feat_cell_class = self.cell_class_decoder(image_features, geometric_features)
 
-        # 4. Dense raw predictions
-        raw_gland = self.gland_head(feat_gland)
-        raw_cell_seg = self.cell_seg_head(feat_cell_seg)
-        raw_cell_class = self.cell_class_head(feat_cell_class)
-
-        # 5. Masking non-task predictions to guarantee zero gradient on non-task patches
-        if task_ids is not None:
-            mask_gland = (task_ids == 0).view(-1, 1, 1, 1).to(dtype=raw_gland.dtype)
-            mask_cell = ((task_ids == 1) | (task_ids == 2)).view(-1, 1, 1, 1).to(dtype=raw_cell_seg.dtype)
-            mask_monuseg = (task_ids == 1).view(-1, 1, 1, 1).to(dtype=raw_cell_seg.dtype)
-            mask_monusac = (task_ids == 2).view(-1, 1, 1, 1).to(dtype=raw_cell_class.dtype)
-
-            # Multiply by task mask to zero out non-task predictions
-            gland_seg = raw_gland * mask_gland
-            cell_seg = raw_cell_seg * mask_cell
-            monuseg_seg = raw_cell_seg * mask_monuseg
-            monusac_seg = raw_cell_seg * mask_monusac
-            cell_class = raw_cell_class * mask_monusac
+            raw_gland = self.gland_head(feat_gland)
+            raw_cell_seg = self.cell_seg_head(feat_cell_seg)
+            raw_cell_class = self.cell_class_head(feat_cell_class)
 
             return {
-                "gland_seg": gland_seg,
-                "glas_seg": gland_seg,
-                "cell_seg": cell_seg,
-                "monuseg_seg": monuseg_seg,
-                "monusac_seg": monusac_seg,
-                "cell_class": cell_class,
-                "monusac_class": cell_class,
-                "segmentation": cell_seg,
-                "classification": cell_class,
+                "gland_seg": raw_gland,
+                "glas_seg": raw_gland,
+                "cell_seg": raw_cell_seg,
+                "monuseg_seg": raw_cell_seg,
+                "monusac_seg": raw_cell_seg,
+                "cell_class": raw_cell_class,
+                "monusac_class": raw_cell_class,
+                "segmentation": raw_cell_seg,
+                "classification": raw_cell_class,
             }
 
-        # Unmasked fallback (e.g. dense feature inspection)
-        return {
-            "gland_seg": raw_gland,
-            "glas_seg": raw_gland,
-            "cell_seg": raw_cell_seg,
-            "monuseg_seg": raw_cell_seg,
-            "monusac_seg": raw_cell_seg,
-            "cell_class": raw_cell_class,
-            "monusac_class": raw_cell_class,
-            "segmentation": raw_cell_seg,
-            "classification": raw_cell_class,
-        }
+        # 4. Memory-Efficient Task-Sliced Training Mode (training=True with task_ids)
+        # Helper to slice multi-scale feature maps for only the relevant task patches
+        def _slice_features(feat_dict: Dict[str, torch.Tensor], idxs: torch.Tensor) -> Dict[str, torch.Tensor]:
+            return {k: v[idxs] for k, v in feat_dict.items()}
+
+        is_gland_idx = (task_ids == 0).nonzero(as_tuple=True)[0]
+        is_cell_idx = ((task_ids == 1) | (task_ids == 2)).nonzero(as_tuple=True)[0]
+        is_monuseg_idx = (task_ids == 1).nonzero(as_tuple=True)[0]
+        is_monusac_idx = (task_ids == 2).nonzero(as_tuple=True)[0]
+
+        outputs: Dict[str, torch.Tensor] = {}
+
+        # 4a. GLaS branch (evaluated ONLY on GLaS patches)
+        if len(is_gland_idx) > 0:
+            feat_gland = self.gland_decoder(
+                _slice_features(image_features, is_gland_idx),
+                _slice_features(geometric_features, is_gland_idx),
+            )
+            pred_gland = self.gland_head(feat_gland)
+            outputs["gland_seg"] = pred_gland
+            outputs["glas_seg"] = pred_gland
+
+        # 4b. Cell Segmentation branch (evaluated on MoNuSeg + MoNuSAC cell patches)
+        if len(is_cell_idx) > 0:
+            feat_cell_seg = self.cell_seg_decoder(
+                _slice_features(image_features, is_cell_idx),
+                _slice_features(geometric_features, is_cell_idx),
+            )
+            pred_cell_seg = self.cell_seg_head(feat_cell_seg)
+            outputs["cell_seg"] = pred_cell_seg
+            outputs["segmentation"] = pred_cell_seg
+
+            # Sub-slice for task-specific keys if needed
+            cell_task_ids = task_ids[is_cell_idx]
+            sub_monuseg = (cell_task_ids == 1)
+            sub_monusac = (cell_task_ids == 2)
+            if sub_monuseg.any():
+                outputs["monuseg_seg"] = pred_cell_seg[sub_monuseg]
+            if sub_monusac.any():
+                outputs["monusac_seg"] = pred_cell_seg[sub_monusac]
+
+        # 4c. Cell Phenotype Classification branch (evaluated ONLY on MoNuSAC patches)
+        if len(is_monusac_idx) > 0:
+            feat_cell_class = self.cell_class_decoder(
+                _slice_features(image_features, is_monusac_idx),
+                _slice_features(geometric_features, is_monusac_idx),
+            )
+            pred_cell_class = self.cell_class_head(feat_cell_class)
+            outputs["cell_class"] = pred_cell_class
+            outputs["monusac_class"] = pred_cell_class
+            outputs["classification"] = pred_cell_class
+
+        return outputs
 

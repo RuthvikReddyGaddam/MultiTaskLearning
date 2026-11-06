@@ -24,7 +24,10 @@ from datasets.glas_dataloader import create_glas_dataloaders, get_glas_dataloade
 from datasets.monuseg_dataset import MoNuSegDataset
 from datasets.monuseg_dataloader import create_monuseg_dataloaders, get_monuseg_dataloader
 
-from datasets.monusac_dataset import MoNuSACDataset, ResampledMoNuSACDataset
+from datasets.monusac_dataset import (
+    MoNuSACDataset,
+    ClassBalancedMoNuSACDataset,
+)
 from datasets.monusac_dataloader import create_monusac_dataloaders, get_monusac_dataloader
 
 from datasets.multitask_augment import MultiTaskSpatialAugmentor
@@ -54,7 +57,7 @@ __all__ = [
     "create_monuseg_dataloaders",
     "get_monuseg_dataloader",
     "MoNuSACDataset",
-    "ResampledMoNuSACDataset",
+    "ClassBalancedMoNuSACDataset",
     "create_monusac_dataloaders",
     "get_monusac_dataloader",
     "MultiTaskSpatialAugmentor",

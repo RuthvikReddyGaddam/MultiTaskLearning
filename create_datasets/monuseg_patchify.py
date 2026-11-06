@@ -43,6 +43,8 @@ def patchify_monuseg_dataset(
     normalize_hv: bool = True,
     save_previews: bool = True,
     preview_dir: Optional[Path] = None,
+    touching_radius: int = 1,
+    gap_kernel_size: int = 5,
 ) -> None:
     dirs = {
         "images": output_dir / "images",
@@ -66,8 +68,13 @@ def patchify_monuseg_dataset(
         preview_dir.mkdir(parents=True, exist_ok=True)
         print(f"Full-size PNG previews will be saved to: {preview_dir}")
 
-    target_patients = patient_ids or TRAIN_PATIENT_IDS
-    patient_dirs = [data_dir / p for p in target_patients if (data_dir / p).is_dir()]
+    if patient_ids is not None:
+        patient_dirs = [data_dir / p for p in patient_ids if (data_dir / p).is_dir()]
+    else:
+        # Automatically use all available patient directories in data_dir (e.g. all 37 patients)
+        patient_dirs = sorted([d for d in data_dir.iterdir() if d.is_dir() and (d / "image.npy").exists()])
+        if not patient_dirs:
+            patient_dirs = [data_dir / p for p in TRAIN_PATIENT_IDS if (data_dir / p).is_dir()]
     print(f"Found {len(patient_dirs)} train patient directories to process in {data_dir}")
     print(f"Patch size: {patch_size}x{patch_size}")
 
@@ -83,7 +90,15 @@ def patchify_monuseg_dataset(
         # 2. Compute full-size SDF, 3-class target, 4-class target, and HV flow
         sdf = compute_instance_sdf(instance_mask)
         target_3class = compute_3class_target(instance_mask) if save_3class else None
-        target_4class = compute_4class_target_with_bottom_hat(instance_mask) if save_4class else None
+        target_4class = (
+            compute_4class_target_with_bottom_hat(
+                instance_mask,
+                kernel_size=gap_kernel_size,
+                touching_radius=touching_radius,
+            )
+            if save_4class
+            else None
+        )
 
         # Optional HV flow map calculation
         hv_map = None
@@ -205,6 +220,18 @@ def main():
         default=None,
         help="Directory to save whole-size PNG previews (defaults to data/monuseg_full_previews).",
     )
+    parser.add_argument(
+        "--touching_radius",
+        type=int,
+        default=1,
+        help="Radius for expanding touching boundary seams within cell bodies (default: 1).",
+    )
+    parser.add_argument(
+        "--gap_kernel_size",
+        type=int,
+        default=5,
+        help="Structuring element diameter for bottom-hat transform (default: 5).",
+    )
     args = parser.parse_args()
 
     out_dir = args.output_dir or (PROJECT_ROOT / "data" / f"monuseg_train_patch_{args.patch_size}")
@@ -218,6 +245,8 @@ def main():
         normalize_hv=args.normalize_hv,
         save_previews=args.save_previews,
         preview_dir=args.preview_dir,
+        touching_radius=args.touching_radius,
+        gap_kernel_size=args.gap_kernel_size,
     )
 
 

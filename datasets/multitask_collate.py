@@ -5,63 +5,79 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_4class_target(instance_masks: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+def compute_4class_target(
+    instance_masks: torch.Tensor,
+    kernel_size: int = 5,
+    touching_radius: int = 1,
+) -> torch.Tensor:
     """
     Vectorized GPU-compatible computation converting [B, 1, H, W] (or [B, H, W])
-    instance ID masks into 4-class semantic masks using the Bottom-Hat transform:
-      0: Background
-      1: Instance Interior (Core)
-      2: Instance Boundary (Contour ring)
-      3: Inter-Instance Gap (Valleys and touching seams via Bottom-Hat transform: Closing(M) - M)
+    instance ID masks into the exact J4 4-class semantic masks:
+      0: Background (Outside cells/glands)
+      1: Cell Interior (M_cell, non-touching cell body pixels)
+      2: Touching Region (Cell pixels directly adjacent to / within touching_radius of a different instance)
+      3: Gap (Background pixels in narrow spaces between cells via Bottom-Hat: Closing(M) - M)
 
     Args:
         instance_masks: [B, 1, H, W] or [B, H, W] integer instance masks.
         kernel_size: Morphological closing kernel size for bottom-hat transform (default: 5).
+        touching_radius: Pixel radius to expand the touching contact interface into contacting instances (default: 1).
 
     Returns:
         target_4class: [B, H, W] long tensor with values in {0, 1, 2, 3}.
     """
     if instance_masks.ndim == 4:
-        inst = instance_masks.float()
+        inst = instance_masks.long()
     else:
-        inst = instance_masks.unsqueeze(1).float()
+        inst = instance_masks.unsqueeze(1).long()
 
     fg = (inst > 0).float()
 
-    # 1. Bottom-Hat Transform via PyTorch max_pool closing:
-    # Closing(M) = Erosion(Dilation(M))
-    # BTH(M) = Closing(M) - M
+    # 1. Morphological Bottom-Hat Transform on background:
+    # Gap pixels are BACKGROUND pixels in narrow valleys/crevices between cells:
+    # BTH(M) = Closing(M) - M (strictly where inst == 0)
     pad = kernel_size // 2
     dilated = F.max_pool2d(fg, kernel_size=kernel_size, stride=1, padding=pad)
     closed = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=pad)
-    bottom_hat = ((closed - fg) > 0.5)
+    gap_mask = ((closed - fg) > 0.5) & (inst == 0)
 
-    # 2. Contact seams between different touching instances
-    s_up = F.pad(inst[:, :, 1:, :], (0, 0, 0, 1), value=0)
-    s_down = F.pad(inst[:, :, :-1, :], (0, 0, 1, 0), value=0)
-    s_left = F.pad(inst[:, :, :, 1:], (0, 1, 0, 0), value=0)
-    s_right = F.pad(inst[:, :, :, :-1], (1, 0, 0, 0), value=0)
+    # 2. Touching Region (Class 2):
+    # FOREGROUND pixels that touch a DIFFERENT cell instance in their 8-neighborhood.
+    # Note: Isolated cells have NO touching region.
+    shifts = [
+        F.pad(inst[:, :, 1:, :], (0, 0, 0, 1), value=0),      # up
+        F.pad(inst[:, :, :-1, :], (0, 0, 1, 0), value=0),     # down
+        F.pad(inst[:, :, :, 1:], (0, 1, 0, 0), value=0),      # left
+        F.pad(inst[:, :, :, :-1], (1, 0, 0, 0), value=0),     # right
+        F.pad(inst[:, :, 1:, 1:], (0, 1, 0, 1), value=0),     # up-left
+        F.pad(inst[:, :, 1:, :-1], (1, 0, 0, 1), value=0),    # up-right
+        F.pad(inst[:, :, :-1, 1:], (0, 1, 1, 0), value=0),    # down-left
+        F.pad(inst[:, :, :-1, :-1], (1, 0, 1, 0), value=0),   # down-right
+    ]
 
-    touch_other = (
-        ((inst > 0) & (s_up > 0) & (inst != s_up)) |
-        ((inst > 0) & (s_down > 0) & (inst != s_down)) |
-        ((inst > 0) & (s_left > 0) & (inst != s_left)) |
-        ((inst > 0) & (s_right > 0) & (inst != s_right))
-    )
-    gap_mask = bottom_hat | touch_other
+    seam_touching = torch.zeros_like(inst, dtype=torch.bool)
+    is_fg = (inst > 0)
+    for s in shifts:
+        seam_touching |= (is_fg & (s > 0) & (inst != s))
 
-    # 3. Interior and Boundary separation
-    diff_up = (inst != s_up)
-    diff_down = (inst != s_down)
-    diff_left = (inst != s_left)
-    diff_right = (inst != s_right)
-    is_boundary = (diff_up | diff_down | diff_left | diff_right) & (inst > 0)
-    is_interior = (inst > 0) & (~is_boundary)
+    # Expand touching region by touching_radius within the foreground
+    if touching_radius > 1:
+        k_touch = 2 * touching_radius + 1
+        pad_t = touching_radius
+        touching_expanded = F.max_pool2d(seam_touching.float(), kernel_size=k_touch, stride=1, padding=pad_t) > 0.5
+        touching_mask = touching_expanded & is_fg
+    else:
+        touching_mask = seam_touching
 
+    # 3. Cell Interior (Class 1):
+    # Foreground pixels that are NOT touching another instance.
+    interior_mask = is_fg & (~touching_mask)
+
+    # Safety check: ensure small instances touching others do not completely disappear
     target_4class = torch.zeros_like(inst, dtype=torch.long)
-    target_4class[is_interior] = 1
-    target_4class[is_boundary] = 2
     target_4class[gap_mask] = 3
+    target_4class[touching_mask] = 2
+    target_4class[interior_mask] = 1
 
     return target_4class.squeeze(1)
 

@@ -65,8 +65,8 @@ model:
       - 16
       - 8
     pooled_sizes:
-      - [32, 32]
-      - [32, 32]
+      - [16, 16]
+      - [16, 16]
       - [32, 32]
       - [32, 32]
     dropout: 0.0
@@ -84,8 +84,9 @@ model:
 
 training:
   epochs: 300
-  batch_size: 8
-  steps_per_epoch: 160
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  steps_per_epoch: 320
 
 optimizer:
   name: Adam
@@ -102,7 +103,6 @@ loss:
   glas_weight: 1.0
   monuseg_weight: 1.0
   monusac_weight: 1.0
-  negative_supervision_weight: 0.5
   j_reg_weight: 1.0
   ce_weight: 1.0
   dice_weight: 0.5

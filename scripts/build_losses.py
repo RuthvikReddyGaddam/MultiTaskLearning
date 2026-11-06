@@ -40,7 +40,6 @@ def build_multitask_loss(config: Dict[str, Any]) -> MultiTaskLoss:
         j_reg_weight=float(loss_cfg.get("j_reg_weight", 1.0)),
         ce_weight=float(loss_cfg.get("ce_weight", 1.0)),
         dice_weight=float(loss_cfg.get("dice_weight", 0.5)),
-        negative_supervision_weight=float(loss_cfg.get("negative_supervision_weight", 0.5)),
         normalize_active_patches=normalize_active_patches,
         monusac_seg_weight=monusac_seg_weight,
         monusac_cls_weight=monusac_cls_weight,

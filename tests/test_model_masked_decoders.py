@@ -78,32 +78,34 @@ class TestModelMaskedDecoders(unittest.TestCase):
         self.assertTrue(hasattr(built_model, "cell_class_decoder"))
 
     def test_forward_shape_and_masking(self):
-        preds = self.model(self.x, task_ids=self.task_ids)
+        # 1. Training mode: task-sliced predictions for memory efficiency
+        self.model.train()
+        train_preds = self.model(self.x, task_ids=self.task_ids)
 
-        self.assertIn("gland_seg", preds)
-        self.assertIn("cell_seg", preds)
-        self.assertIn("cell_class", preds)
+        self.assertIn("gland_seg", train_preds)
+        self.assertIn("cell_seg", train_preds)
+        self.assertIn("cell_class", train_preds)
 
-        # Shapes must match [B, C, H, W]
-        self.assertEqual(preds["gland_seg"].shape, (self.B, 4, self.H, self.W))
-        self.assertEqual(preds["cell_seg"].shape, (self.B, 4, self.H, self.W))
-        self.assertEqual(preds["cell_class"].shape, (self.B, 5, self.H, self.W))
+        # Shapes must match task-sliced allocations:
+        # 4 GLaS patches (indices 0..3)
+        self.assertEqual(train_preds["gland_seg"].shape, (4, 4, self.H, self.W))
+        # 4 Cell patches (2 MoNuSeg + 2 MoNuSAC)
+        self.assertEqual(train_preds["cell_seg"].shape, (4, 4, self.H, self.W))
+        self.assertEqual(train_preds["monuseg_seg"].shape, (2, 4, self.H, self.W))
+        self.assertEqual(train_preds["monusac_seg"].shape, (2, 4, self.H, self.W))
+        # 2 MoNuSAC patches
+        self.assertEqual(train_preds["cell_class"].shape, (2, 5, self.H, self.W))
 
-        # Check masking:
-        # GLaS patches (indices 0..3): gland_seg is active, cell_seg & cell_class are 0
-        self.assertTrue((preds["gland_seg"][:4].abs() > 0).any())
-        self.assertEqual(preds["cell_seg"][:4].abs().sum().item(), 0.0)
-        self.assertEqual(preds["cell_class"][:4].abs().sum().item(), 0.0)
+        # 2. Evaluation / Dense inference mode: all decoders evaluate densely across all B patches
+        self.model.eval()
+        with torch.no_grad():
+            eval_preds = self.model(self.x)
 
-        # MoNuSeg patches (indices 4..5): cell_seg is active, gland_seg & cell_class are 0
-        self.assertEqual(preds["gland_seg"][4:6].abs().sum().item(), 0.0)
-        self.assertTrue((preds["cell_seg"][4:6].abs() > 0).any())
-        self.assertEqual(preds["cell_class"][4:6].abs().sum().item(), 0.0)
-
-        # MoNuSAC patches (indices 6..7): cell_seg & cell_class are active, gland_seg is 0
-        self.assertEqual(preds["gland_seg"][6:].abs().sum().item(), 0.0)
-        self.assertTrue((preds["cell_seg"][6:].abs() > 0).any())
-        self.assertTrue((preds["cell_class"][6:].abs() > 0).any())
+        self.assertEqual(eval_preds["gland_seg"].shape, (self.B, 4, self.H, self.W))
+        self.assertEqual(eval_preds["cell_seg"].shape, (self.B, 4, self.H, self.W))
+        self.assertEqual(eval_preds["monuseg_seg"].shape, (self.B, 4, self.H, self.W))
+        self.assertEqual(eval_preds["monusac_seg"].shape, (self.B, 4, self.H, self.W))
+        self.assertEqual(eval_preds["cell_class"].shape, (self.B, 5, self.H, self.W))
 
     def test_gradient_isolation_gland_only(self):
         self.model.zero_grad()

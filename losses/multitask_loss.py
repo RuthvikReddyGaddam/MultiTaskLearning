@@ -5,21 +5,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from losses.j_regularization_loss import JRegularizedMultiClassLoss
+from losses.j_regularization_loss import JRegularizedMultiClassLoss, MultiClassDiceLoss
 
 
 class MultiTaskLoss(nn.Module):
     """
-    Decoupled Multi-Task Loss with 4-Channel Youden's J-Regularization for:
-      - GLaS:    4-class gland segmentation (bg, inside, boundary, gap)
-      - MoNuSeg: 4-class cell nuclei segmentation (bg, inside, boundary, gap)
-      - MoNuSAC: Shared 4-class cell nuclei segmentation + 5-class cell phenotype classification
-
-    Key Advantages over Flow Regression:
-      1. Intrinsic class balancing via Youden's J-statistic (Sensitivity + Specificity - 1)
-         eliminates manual weighting and prevents optimization stalls on rare gap pixels.
-      2. Bottom-Hat transform explicitly extracts inter-cellular clefts and touching contact seams.
-      3. Zero flow prediction dependencies (faster training, fewer hyper-parameters, no Eikonal shock issues).
+    Decoupled Multi-Task Loss with J4 Topological Regularization:
+      - GLaS:    4-class gland segmentation (bg, cell, touching, gap) via J-Regularization
+      - MoNuSeg: 4-class cell nuclei segmentation (bg, cell, touching, gap) via J-Regularization
+      - MoNuSAC: Shared 4-class cell segmentation + 5-class whole-patch cell phenotype classification
+                 via unweighted Cross-Entropy + MultiClass Dice (without J-regularization).
     """
     def __init__(
         self,
@@ -32,7 +27,6 @@ class MultiTaskLoss(nn.Module):
         num_gland_classes: int = 4,
         num_cell_classes: int = 4,
         num_classification_classes: int = 5,
-        negative_supervision_weight: float = 0.5,
         normalize_active_patches: bool = True,
         **kwargs,
     ):
@@ -43,12 +37,11 @@ class MultiTaskLoss(nn.Module):
         self.j_reg_weight = float(j_reg_weight)
         self.ce_weight = float(ce_weight)
         self.dice_weight = float(dice_weight)
-        self.negative_supervision_weight = float(negative_supervision_weight)
         self.normalize_active_patches = bool(normalize_active_patches)
         self.monusac_seg_weight = float(kwargs.get("monusac_seg_weight", 0.5 if self.normalize_active_patches else 1.0))
         self.monusac_cls_weight = float(kwargs.get("monusac_cls_weight", 0.5 if self.normalize_active_patches else 1.0))
 
-        # 1. GLaS 4-Class Loss (bg, gland inside, boundary, bottom-hat gap)
+        # 1. GLaS 4-Class Segmentation Loss (bg, gland cell, touching, gap)
         self.glas_seg_loss = JRegularizedMultiClassLoss(
             num_classes=num_gland_classes,
             ce_weight=ce_weight,
@@ -56,7 +49,7 @@ class MultiTaskLoss(nn.Module):
             dice_weight=dice_weight,
         )
 
-        # 2. Shared Cell 4-Class Loss (bg, nucleus inside, boundary, bottom-hat gap)
+        # 2. Shared Cell 4-Class Segmentation Loss (bg, nucleus cell, touching, gap)
         self.cell_seg_loss = JRegularizedMultiClassLoss(
             num_classes=num_cell_classes,
             ce_weight=ce_weight,
@@ -64,12 +57,12 @@ class MultiTaskLoss(nn.Module):
             dice_weight=dice_weight,
         )
 
-        # 3. MoNuSAC Multi-Class Phenotype Classification Loss (5 classes)
-        self.cell_cls_loss = JRegularizedMultiClassLoss(
+        # 3. MoNuSAC 5-Class Whole-Patch Phenotype Classification Loss:
+        # Strictly unweighted Cross-Entropy (weight=None) + MultiClass Dice (NO J-regularization)
+        self.cls_ce_loss = nn.CrossEntropyLoss(weight=None, ignore_index=-1)
+        self.cls_dice_loss = MultiClassDiceLoss(
             num_classes=num_classification_classes,
-            ce_weight=ce_weight,
-            j_weight=j_reg_weight,
-            dice_weight=dice_weight,
+            include_background=True,
         )
 
     def forward(
@@ -142,7 +135,7 @@ class MultiTaskLoss(nn.Module):
             "weight_eff_monusac_cls": float(eff_monusac_cls_w),
         }
 
-        # 1. GLaS (gland segmentation + negative background supervision)
+        # 1. GLaS (gland segmentation)
         if is_gland.any() and eff_glas_w > 0.0:
             target_gland = target_seg[is_gland]
             p_gland = preds.get("gland_seg", preds.get("glas_seg"))
@@ -151,23 +144,11 @@ class MultiTaskLoss(nn.Module):
                 l_gland_dict = self.glas_seg_loss(p_gland_slice, target_gland)
                 l_gland = l_gland_dict["total_loss"]
 
-                l_neg = torch.tensor(0.0, device=target_seg.device)
-                if "gland_neg" in preds and self.negative_supervision_weight > 0.0:
-                    p_gland_neg = preds["gland_neg"]
-                    target_neg = torch.zeros(
-                        (p_gland_neg.shape[0], p_gland_neg.shape[-2], p_gland_neg.shape[-1]),
-                        dtype=torch.long,
-                        device=p_gland_neg.device,
-                    )
-                    l_neg = F.cross_entropy(p_gland_neg, target_neg)
-                    l_gland = l_gland + self.negative_supervision_weight * l_neg
-
                 total_loss = total_loss + eff_glas_w * l_gland
                 logs["loss_glas_total"] = l_gland.detach()
                 logs["loss_glas_ce"] = l_gland_dict["ce_loss"].detach()
                 logs["loss_glas_j"] = l_gland_dict["j_loss"].detach()
                 logs["loss_glas_dice"] = l_gland_dict["dice_loss"].detach()
-                logs["loss_glas_neg"] = l_neg.detach()
 
         # 2. MoNuSeg (cell nuclei segmentation)
         if is_monuseg.any() and eff_monuseg_w > 0.0:
@@ -193,11 +174,11 @@ class MultiTaskLoss(nn.Module):
                 logs["loss_monuseg_j"] = l_monuseg_dict["j_loss"].detach()
                 logs["loss_monuseg_dice"] = l_monuseg_dict["dice_loss"].detach()
 
-        # 3. MoNuSAC (cell nuclei segmentation + 5-class cell phenotype classification)
+        # 3. MoNuSAC (cell nuclei segmentation + 5-class whole-patch cell phenotype classification)
         if is_monusac.any():
             target_monusac = target_seg[is_monusac]
             if eff_monusac_seg_w > 0.0:
-                p_monusac_seg = preds.get("monusac_seg")
+                p_monusac_seg = preds.get("monusac_seg", preds.get("monuseg_seg"))
                 if p_monusac_seg is not None and p_monusac_seg.shape[0] == B:
                     p_monusac_seg = p_monusac_seg[is_monusac]
                 elif p_monusac_seg is None and "cell_seg" in preds:
@@ -214,22 +195,38 @@ class MultiTaskLoss(nn.Module):
                     l_monusac_seg = l_monusac_seg_dict["total_loss"]
                     total_loss = total_loss + eff_monusac_seg_w * l_monusac_seg
                     logs["loss_monusac_seg_total"] = l_monusac_seg.detach()
-                    logs["loss_monusac_seg_j"] = l_monusac_seg_dict["j_loss"].detach() if "j_loss" in l_monusac_seg_dict else torch.tensor(0.0)
+                    logs["loss_monusac_seg_ce"] = l_monusac_seg_dict["ce_loss"].detach()
+                    logs["loss_monusac_seg_j"] = l_monusac_seg_dict["j_loss"].detach()
+                    logs["loss_monusac_seg_dice"] = l_monusac_seg_dict["dice_loss"].detach()
 
             if eff_monusac_cls_w > 0.0:
                 p_cls = preds.get("cell_class", preds.get("monusac_class"))
                 if p_cls is not None:
                     p_cls_slice = p_cls[is_monusac] if p_cls.shape[0] == B else p_cls
-                    sac_cls_gt = batch["class_map"][is_monusac]
-                    valid_mask = (sac_cls_gt >= 0).float()
-                    safe_targets = sac_cls_gt.clamp(min=0)
-                    l_cls_dict = self.cell_cls_loss(p_cls_slice, safe_targets, mask=valid_mask)
-                    l_cls = l_cls_dict["total_loss"]
+                    sac_cls_gt = batch["class_map"][is_monusac]  # [N, H, W] with 0..4 (and -1 if padded)
+
+                    # Check if there are any valid supervised pixels (sac_cls_gt >= 0)
+                    valid_mask_bool = (sac_cls_gt >= 0)
+                    if valid_mask_bool.any():
+                        # 1. Unweighted Cross-Entropy loss over the whole patch (no class weighting)
+                        l_cls_ce = self.cls_ce_loss(p_cls_slice, sac_cls_gt)
+
+                        # 2. MultiClass Dice loss over the whole patch (valid where sac_cls_gt >= 0)
+                        valid_mask = valid_mask_bool.float()
+                        safe_targets = sac_cls_gt.clamp(min=0)
+                        l_cls_dice = self.cls_dice_loss(p_cls_slice, safe_targets, mask=valid_mask)
+
+                        l_cls = self.ce_weight * l_cls_ce + self.dice_weight * l_cls_dice
+                    else:
+                        l_cls_ce = torch.tensor(0.0, device=target_seg.device, requires_grad=True)
+                        l_cls_dice = torch.tensor(0.0, device=target_seg.device, requires_grad=True)
+                        l_cls = torch.tensor(0.0, device=target_seg.device, requires_grad=True)
+
                     total_loss = total_loss + eff_monusac_cls_w * l_cls
+
                     logs["loss_monusac_cls_total"] = l_cls.detach()
-                    logs["loss_monusac_cls_ce"] = l_cls_dict["ce_loss"].detach()
-                    logs["loss_monusac_cls_j"] = l_cls_dict["j_loss"].detach()
-                    logs["loss_monusac_cls_dice"] = l_cls_dict["dice_loss"].detach()
+                    logs["loss_monusac_cls_ce"] = l_cls_ce.detach()
+                    logs["loss_monusac_cls_dice"] = l_cls_dice.detach()
 
         logs["total_loss"] = total_loss.detach()
         return total_loss, logs
